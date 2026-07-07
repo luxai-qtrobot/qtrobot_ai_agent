@@ -111,6 +111,39 @@ def stream_round(client, history, tools=None, label=""):
     return assistant_msg, ordered
 
 
+def print_memory(history):
+    """Pretty-print the chat history for the '/mem' debug command - long content
+    (e.g. base64 image data) is truncated so it doesn't flood the terminal."""
+    print(f"\n--- memory ({len(history)} messages) ---")
+    for i, msg in enumerate(history):
+        role = msg.get("role", "?")
+        content = msg.get("content")
+
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if block.get("type") == "image_url":
+                    url = block["image_url"]["url"]
+                    parts.append(f"<image, {len(url)} chars>")
+                else:
+                    parts.append(str(block))
+            content_str = " ".join(parts)
+        else:
+            content_str = content or ""
+            if len(content_str) > 300:
+                content_str = content_str[:300] + f"... <{len(content_str)} chars total>"
+
+        extra = ""
+        if msg.get("tool_calls"):
+            calls = ", ".join(f"{tc['function']['name']}({tc['function']['arguments']})" for tc in msg["tool_calls"])
+            extra = f"  tool_calls=[{calls}]"
+        if msg.get("tool_call_id"):
+            extra = f"  tool_call_id={msg['tool_call_id']}"
+
+        print(f"[{i}] {role}: {content_str}{extra}")
+    print("--- end memory ---\n")
+
+
 async def main():
     robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
@@ -135,13 +168,16 @@ async def main():
             history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
             Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what is 12 plus 30?', "
-                        "'what do you see?', or 'play the bye gesture'.")
+                        "'what do you see?', or 'play the bye gesture'. '/mem' shows the chat history.")
             while True:
                 user_input = input("You: ").strip()
                 if not user_input:
                     continue
                 if user_input.lower() in ("exit", "quit"):
                     break
+                if user_input == "/mem":
+                    print_memory(history)
+                    continue
 
                 history.append({"role": "user", "content": user_input})
 

@@ -6,3 +6,5 @@ torchaudio
 luxai-robot[asr-parakeet]
 luxai-magpie[mcp]
 simplejpeg
+openai
+numpy
