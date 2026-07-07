@@ -1,0 +1,8 @@
+
+#uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# --extra-index-url https://download.pytorch.org/whl/cpu
+torch 
+torchaudio
+luxai-robot[asr-parakeet]
+luxai-magpie[mcp]
+simplejpeg
