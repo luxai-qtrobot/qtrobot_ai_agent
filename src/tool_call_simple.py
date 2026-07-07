@@ -27,7 +27,14 @@ from luxai.robot.core import Robot
 from agents.agent import Agent
 from agents.user_agents import USER_TOOLS_ENDPOINT, UserAgents
 
-ROBOT_IP =  "192.168.3.111"
+ROBOT_IP = "192.168.3.111"
+ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
+
+ROBOT_TOOL_WHITELIST = {
+    "gesture_cancel",
+    "gesture_file_list",
+    "gesture_file_play",
+}
 
 LLM_API_BASE = "http://192.168.3.111:8080/v1"
 LLM_MODEL = "gemma-4-12B-it-Q8_0.gguf"
@@ -36,7 +43,8 @@ SYSTEM_PROMPT = (
     "You are a helpful assistant. Use the available tools when they let you answer "
     "more accurately. Otherwise just reply in plain text. "
     "When you call a tool, you can include a short spoken reply in the same response "
-    "(e.g. 'Sure, one moment!') acknowledging what you're doing where needed."
+    "(e.g. 'Sure, one moment!') acknowledging what you're doing where needed. "
+    "Strip .xml from gesture names before calling gesture_file_play."
 )
 
 
@@ -104,22 +112,30 @@ def stream_round(client, history, tools=None, label=""):
 
 
 async def main():
-    robot = Robot.connect_zmq(endpoint=f"tcp://{ROBOT_IP}:50500")
+    robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
     robot.enable_plugin_zmq("realsense-driver", endpoint=f"tcp://{ROBOT_IP}:50750")
 
     user_agents = UserAgents(robot)
     user_requester = ZMQRpcRequester(USER_TOOLS_ENDPOINT)
+    robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
 
     try:
-        async with Client(McpTransport(user_requester)) as user_client:
-            agent = Agent(sources={"user": user_client})
+        async with (
+            Client(McpTransport(user_requester)) as user_client,
+            Client(McpTransport(robot_requester)) as robot_client,
+        ):
+            agent = Agent(
+                sources={"user": user_client, "robot": robot_client},
+                whitelists={"robot": ROBOT_TOOL_WHITELIST},
+            )
             await agent.discover()
 
             client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
             history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-            Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what is 12 plus 30?', or 'what do you see?'")
+            Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what is 12 plus 30?', "
+                        "'what do you see?', or 'play the bye gesture'.")
             while True:
                 user_input = input("You: ").strip()
                 if not user_input:
@@ -160,6 +176,7 @@ async def main():
                     round_num += 1
     finally:
         user_requester.close()
+        robot_requester.close()
         user_agents.terminate(timeout=1.0)
         robot.close()
 
