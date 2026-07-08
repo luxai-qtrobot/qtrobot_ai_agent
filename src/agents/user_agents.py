@@ -17,6 +17,7 @@ from simplejpeg import encode_jpeg
 from luxai.magpie.nodes import ServerNode
 from luxai.magpie.schema import McpSchema
 from luxai.magpie.transport import ZMQRpcResponder
+from luxai.magpie.utils import Logger
 
 USER_TOOLS_ENDPOINT = "inproc://user-tools"
 
@@ -26,9 +27,9 @@ class UserAgents(ServerNode):
     def __init__(self, robot):
         self.robot = robot
         self.schema = McpSchema(name="user-tools", version="1.0.0")
+        self._camera_reader = None  # lazily opened on first get_image() call, kept open after
 
-        self.schema.method()(self.get_time)
-        self.schema.method()(self.add_numbers)
+        self.schema.method()(self.get_datetime)
         self.schema.method()(self.get_image)
 
         # Tools must be registered above before this runs - BaseNode.__init__() starts
@@ -36,22 +37,20 @@ class UserAgents(ServerNode):
         responder = ZMQRpcResponder(USER_TOOLS_ENDPOINT, schema=self.schema)
         super().__init__(name="user-tools-server", responder=responder)
 
-    def get_time(self) -> str:
-        """Get the current wall-clock time."""
-        return datetime.now().strftime("%H:%M:%S")
+    def get_datetime(self) -> str:
+        """Get the current date and time."""
+        return datetime.now().strftime("%A, %Y-%m-%d %H:%M:%S")
 
-    def add_numbers(self, a: float, b: float) -> float:
-        """Add two numbers together."""
-        return a + b
 
     def get_image(self) -> dict:
         """Capture a single color image from the robot's camera, for visual questions
-        like 'what do you see?'."""
-        reader = self.robot.camera.stream.open_color_reader()
-        try:
-            frame = reader.read(timeout=3.0)
-        finally:
-            reader.close()
+        like 'what do you see?'. The reader is opened once (on first call) and kept open
+        - queue_size=1/delivery=latest means every read() still gets the current frame,
+        so there's no staleness cost, only savings from skipping subscribe/teardown on
+        every call."""
+        if self._camera_reader is None:
+            self._camera_reader = self.robot.camera.stream.open_color_reader()
+        frame = self._camera_reader.read(timeout=3.0)
 
         # open_color_reader() is documented as always producing BGR - no need to trust
         # frame.pixel_format, which carries RealSense's raw format string ("BGR8").
@@ -63,3 +62,14 @@ class UserAgents(ServerNode):
         # JSON-serialized into that text block; Agent._to_result() knows to unpack this
         # specific {mimeType, data} shape back into a real image for the LLM.
         return {"mimeType": "image/jpeg", "data": base64.b64encode(jpeg_bytes).decode("ascii")}
+
+    def cleanup(self) -> None:
+        """Close the camera reader (if ever opened) before the usual ServerNode cleanup
+        (executor shutdown + responder close)."""
+        if self._camera_reader is not None:
+            try:
+                self._camera_reader.close()
+            except Exception as e:
+                Logger.warning(f"{self.name}: error closing camera reader: {e}")
+            self._camera_reader = None
+        super().cleanup()
