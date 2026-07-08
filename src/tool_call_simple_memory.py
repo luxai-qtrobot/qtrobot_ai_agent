@@ -1,17 +1,15 @@
 """
-tool_call_simple.py - Tool-calling chat loop using our Agent class (agents/agent.py) for
-tool discovery/dispatch, with streaming + sentence-level "[SPEAK]" output exactly as
-validated before. Tools are served over a real (local, inproc) MCP server
-(agents/user_agents.py), via magpie's McpSchema + ServerNode - the same mechanism a real
-robot MCP source would use, just pointed at an in-process server instead of the robot.
+tool_call_simple_memory.py - Same tool-calling chat loop as tool_call_simple.py, but
+using RobotMemory (working + short-term tiers) instead of a plain history list, to
+exercise the memory system end-to-end.
 
 No ASR/TTS - terminal in, terminal out. "[SPEAK] ..." stands in for TTS.
 
 Requirements:
-    pip install openai luxai-magpie[mcp,video]
+    pip install openai luxai-magpie[mcp,video] tiktoken
 
 Usage (from this file's directory):
-    python tool_call_simple.py
+    python tool_call_simple_memory.py
 """
 
 import asyncio
@@ -26,6 +24,9 @@ from luxai.robot.core import Robot
 
 from agents.agent import Agent
 from agents.user_agents import USER_TOOLS_ENDPOINT, UserAgents
+from memory.robot_memory import RobotMemory
+from memory.short_term_memory import ShortTermMemory
+from memory.working_memory import WorkingMemory
 
 ROBOT_IP = "192.168.3.111"
 ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
@@ -39,6 +40,8 @@ ROBOT_TOOL_WHITELIST = {
 LLM_API_BASE = "http://192.168.3.111:8080/v1"
 LLM_MODEL = "gemma-4-12B-it-Q8_0.gguf"
 
+MEMORY_MAX_TOKENS = 512 # 8000
+
 SYSTEM_PROMPT = (
     "You are a helpful assistant. Use the available tools when they let you answer "
     "more accurately. Otherwise just reply in plain text. "
@@ -50,16 +53,16 @@ SYSTEM_PROMPT = (
 
 # ---------------------------------------------------------------------------
 # Streaming, unchanged from the raw-openai validation - still the only place
-# that talks to the LLM.
+# that talks to the LLM for the live conversation.
 # ---------------------------------------------------------------------------
 
-def stream_round(client, history, tools=None, label=""):
+def stream_round(client, messages, tools=None, label=""):
     """Run one streaming completion, printing each delta so we can see the two channels
     (plain content vs. tool_calls) arrive separately. Returns an assistant message dict
-    (ready to append to history) plus the parsed {name, args, id} for any tool calls."""
+    (ready to add to memory) plus the parsed {name, args, id} for any tool calls."""
     stream = client.chat.completions.create(
         model=LLM_MODEL,
-        messages=history,
+        messages=messages,
         tools=tools,
         tool_choice="auto" if tools else None,
         stream=True,
@@ -111,39 +114,6 @@ def stream_round(client, history, tools=None, label=""):
     return assistant_msg, ordered
 
 
-def print_memory(history):
-    """Pretty-print the chat history for the '/mem' debug command - long content
-    (e.g. base64 image data) is truncated so it doesn't flood the terminal."""
-    print(f"\n--- memory ({len(history)} messages) ---")
-    for i, msg in enumerate(history):
-        role = msg.get("role", "?")
-        content = msg.get("content")
-
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if block.get("type") == "image_url":
-                    url = block["image_url"]["url"]
-                    parts.append(f"<image, {len(url)} chars>")
-                else:
-                    parts.append(str(block))
-            content_str = " ".join(parts)
-        else:
-            content_str = content or ""
-            if len(content_str) > 300:
-                content_str = content_str[:300] + f"... <{len(content_str)} chars total>"
-
-        extra = ""
-        if msg.get("tool_calls"):
-            calls = ", ".join(f"{tc['function']['name']}({tc['function']['arguments']})" for tc in msg["tool_calls"])
-            extra = f"  tool_calls=[{calls}]"
-        if msg.get("tool_call_id"):
-            extra = f"  tool_call_id={msg['tool_call_id']}"
-
-        print(f"[{i}] {role}: {content_str}{extra}")
-    print("--- end memory ---\n")
-
-
 async def main():
     robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
@@ -152,6 +122,20 @@ async def main():
     user_agents = UserAgents(robot)
     user_requester = ZMQRpcRequester(USER_TOOLS_ENDPOINT)
     robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
+
+    # Single sync client, shared between the live streaming chat and short_term's
+    # background summarization thread - the SDK's client is safe to call from multiple
+    # threads at once, no need for a separate async client.
+    client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
+
+    # Constructed before the try block (like the connections above) so it's always
+    # defined by the time `finally` runs, even if something below fails early.
+    memory = RobotMemory(
+        static=SYSTEM_PROMPT,
+        max_tokens=MEMORY_MAX_TOKENS,
+        working=WorkingMemory(size_ratio=0.75, flush_ratio=0.2),
+        short_term=ShortTermMemory(llm=client, model=LLM_MODEL, size_ratio=0.25, flush_ratio=0.2),
+    )
 
     try:
         async with (
@@ -165,11 +149,9 @@ async def main():
             await agent.discover()
             agent.print_schemas(raw=True)
 
-            client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
-            history = [{"role": "system", "content": SYSTEM_PROMPT}]
-
             Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what is 12 plus 30?', "
-                        "'what do you see?', or 'play the bye gesture'. '/mem' shows the chat history.")
+                        "'what do you see?', or 'play the bye gesture'. '/mem' shows memory "
+                        "('/mem raw' for the exact JSON sent to the LLM).")
             while True:
                 user_input = input("You: ").strip()
                 if not user_input:
@@ -177,10 +159,13 @@ async def main():
                 if user_input.lower() in ("exit", "quit"):
                     break
                 if user_input == "/mem":
-                    print_memory(history)
+                    memory.print()
+                    continue
+                if user_input == "/mem raw":
+                    memory.print(raw=True)
                     continue
 
-                history.append({"role": "user", "content": user_input})
+                memory.add({"role": "user", "content": user_input})
 
                 # No fixed "round 1 / round 2" split - keep looping: each round may carry
                 # speakable content, tool_calls, both, or neither. Speak whatever content
@@ -188,8 +173,9 @@ async def main():
                 # a round comes back with no tool_calls (that round ends the turn).
                 round_num = 1
                 while True:
-                    message, tool_calls = stream_round(client, history, tools=agent.schemas(), label=f"round {round_num}")
-                    history.append(message)
+                    messages = memory.get()
+                    message, tool_calls = stream_round(client, messages, tools=agent.schemas(), label=f"round {round_num}")
+                    memory.add(message)
 
                     if message.get("content"):
                         Logger.info(f"[SPEAK] {message['content']}")
@@ -203,19 +189,23 @@ async def main():
                     results = await agent.execute(tool_calls)
                     for r in results:
                         Logger.info(f"[tool result] {r['content']}")
-                        history.append({
+                        memory.add({
                             "role": "tool",
                             "tool_call_id": r["tool_call_id"],
                             "content": r["content"],
                         })
-                        history.extend(r["extra_messages"])
+                        for extra in r["extra_messages"]:
+                            memory.add(extra)
 
                     round_num += 1
+
+                memory.end_turn()
     finally:
         user_requester.close()
         robot_requester.close()
         user_agents.terminate(timeout=1.0)
         robot.close()
+        memory.flush_all()
 
 
 if __name__ == "__main__":

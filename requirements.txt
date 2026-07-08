@@ -8,3 +8,4 @@ luxai-magpie[mcp]
 simplejpeg
 openai
 numpy
+tiktoken

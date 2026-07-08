@@ -62,6 +62,22 @@ class Agent:
     def schemas(self) -> list[dict]:
         return self._schemas
 
+    def print_schemas(self, raw: bool = False) -> None:
+        """Pretty-print every discovered/merged tool schema - name, source, description,
+        parameters - for inspection (e.g. from a '/tools' debug command). raw=True dumps
+        the exact JSON list as sent to the LLM instead."""
+        if raw:
+            print(json.dumps(self._schemas, indent=2))
+            return
+
+        print(f"\n--- tools ({len(self._schemas)}) ---")
+        for schema in self._schemas:
+            fn = schema["function"]
+            source = self._tools[fn["name"]][1]
+            print(f"[{source}] {fn['name']}: {fn['description']}")
+            print(f"    parameters: {json.dumps(fn['parameters'])}")
+        print("--- end tools ---\n")
+
     async def execute(self, tool_calls: list[dict]) -> list[dict]:
         """tool_calls: [{'id', 'name', 'arguments'(json str)}, ...], run concurrently.
         Returns [{'tool_call_id', 'content', 'extra_messages'}, ...] - never raises;
