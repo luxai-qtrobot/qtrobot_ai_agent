@@ -1,9 +1,10 @@
 """
-tool_call_simple.py - Tool-calling chat loop using our Agent class (agents/agent.py) for
-tool discovery/dispatch, with streaming + sentence-level "[SPEAK]" output exactly as
-validated before. Tools are served over a real (local, inproc) MCP server
-(agents/user_agents.py), via magpie's McpSchema + ServerNode - the same mechanism a real
-robot MCP source would use, just pointed at an in-process server instead of the robot.
+tool_call_simple.py - Tool-calling chat loop using our ToolEngine class
+(tool/tool_engine.py) for tool discovery/dispatch, with streaming + sentence-level
+"[SPEAK]" output exactly as validated before. Tools are served over a real (local,
+inproc) MCP server (tool/user_tools.py), via magpie's McpSchema + ServerNode - the
+same mechanism a real robot MCP source would use, just pointed at an in-process server
+instead of the robot.
 
 No ASR/TTS - terminal in, terminal out. "[SPEAK] ..." stands in for TTS.
 
@@ -24,8 +25,8 @@ from luxai.magpie.transport import ZMQRpcRequester
 from luxai.magpie.utils import Logger
 from luxai.robot.core import Robot
 
-from agents.agent import Agent
-from agents.user_agents import USER_TOOLS_ENDPOINT, UserAgents
+from tool.tool_engine import ToolEngine
+from tool.user_tools import USER_TOOLS_ENDPOINT, UserTools
 
 ROBOT_IP = "192.168.3.111"
 ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
@@ -149,7 +150,7 @@ async def main():
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
     robot.enable_plugin_zmq("realsense-driver", endpoint=f"tcp://{ROBOT_IP}:50750")
 
-    user_agents = UserAgents(robot)
+    user_tools = UserTools(robot)
     user_requester = ZMQRpcRequester(USER_TOOLS_ENDPOINT)
     robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
 
@@ -158,12 +159,12 @@ async def main():
             Client(McpTransport(user_requester)) as user_client,
             Client(McpTransport(robot_requester)) as robot_client,
         ):
-            agent = Agent(
+            tool_engine = ToolEngine(
                 sources={"user": user_client, "robot": robot_client},
                 whitelists={"robot": ROBOT_TOOL_WHITELIST},
             )
-            await agent.discover()
-            agent.print_schemas(raw=True)
+            await tool_engine.discover()
+            tool_engine.print_schemas(raw=True)
 
             client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
             history = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -188,7 +189,7 @@ async def main():
                 # a round comes back with no tool_calls (that round ends the turn).
                 round_num = 1
                 while True:
-                    message, tool_calls = stream_round(client, history, tools=agent.schemas(), label=f"round {round_num}")
+                    message, tool_calls = stream_round(client, history, tools=tool_engine.schemas(), label=f"round {round_num}")
                     history.append(message)
 
                     if message.get("content"):
@@ -200,7 +201,7 @@ async def main():
                     for tc in tool_calls:
                         Logger.info(f"[tool call] {tc['name']}({tc['arguments']})")
 
-                    results = await agent.execute(tool_calls)
+                    results = await tool_engine.execute(tool_calls)
                     for r in results:
                         Logger.info(f"[tool result] {r['content']}")
                         history.append({
@@ -214,7 +215,7 @@ async def main():
     finally:
         user_requester.close()
         robot_requester.close()
-        user_agents.terminate(timeout=1.0)
+        user_tools.terminate(timeout=1.0)
         robot.close()
 
 

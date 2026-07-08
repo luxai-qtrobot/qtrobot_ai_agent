@@ -1,7 +1,7 @@
 """
-user_agents.py - User-defined tools, served as a local MCP server over ZMQ inproc.
+user_tools.py - User-defined tools, served as a local MCP server over ZMQ inproc.
 
-UserAgents *is* the server node: it holds an already-connected Robot instance
+UserTools *is* the server node: it holds an already-connected Robot instance
 (connected + plugin-enabled by the caller), registers its own bound methods as MCP tools
 (schemas derived from each method's signature + docstring via McpSchema, no hand-written
 JSON schema), and manages its own responder/thread lifecycle via ServerNode. Add new user
@@ -22,7 +22,7 @@ from luxai.magpie.utils import Logger
 USER_TOOLS_ENDPOINT = "inproc://user-tools"
 
 
-class UserAgents(ServerNode):
+class UserTools(ServerNode):
 
     def __init__(self, robot):
         self.robot = robot
@@ -59,8 +59,8 @@ class UserAgents(ServerNode):
 
         # McpSchema always wraps tool results as a text block (see mcp_schema.py's
         # _mcp_tools_call) - there's no native "image" content type yet. This dict gets
-        # JSON-serialized into that text block; Agent._to_result() knows to unpack this
-        # specific {mimeType, data} shape back into a real image for the LLM.
+        # JSON-serialized into that text block; ToolEngine._to_result() knows to unpack
+        # this specific {mimeType, data} shape back into a real image for the LLM.
         return {"mimeType": "image/jpeg", "data": base64.b64encode(jpeg_bytes).decode("ascii")}
 
     def cleanup(self) -> None:

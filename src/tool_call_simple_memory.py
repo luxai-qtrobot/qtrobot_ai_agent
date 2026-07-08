@@ -22,9 +22,9 @@ from luxai.magpie.transport import ZMQRpcRequester
 from luxai.magpie.utils import Logger
 from luxai.robot.core import Robot
 
-from agents.agent import Agent
-from agents.user_agents import USER_TOOLS_ENDPOINT, UserAgents
-from llm_engine import LLMEngine
+from tool.tool_engine import ToolEngine
+from tool.user_tools import USER_TOOLS_ENDPOINT, UserTools
+from llm.llm_engine import LLMEngine
 from memory.robot_memory import RobotMemory
 from memory.short_term_memory import ShortTermMemory
 from memory.working_memory import WorkingMemory
@@ -65,7 +65,7 @@ async def main():
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
     robot.enable_plugin_zmq("realsense-driver", endpoint=f"tcp://{ROBOT_IP}:50750")
 
-    user_agents = UserAgents(robot)
+    user_tools = UserTools(robot)
     user_requester = ZMQRpcRequester(USER_TOOLS_ENDPOINT)
     robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
 
@@ -88,14 +88,14 @@ async def main():
             Client(McpTransport(user_requester)) as user_client,
             Client(McpTransport(robot_requester)) as robot_client,
         ):
-            agent = Agent(
+            tool_engine = ToolEngine(
                 sources={"user": user_client, "robot": robot_client},
                 whitelists={"robot": ROBOT_TOOL_WHITELIST},
             )
-            await agent.discover()
-            agent.print_schemas(raw=False)
+            await tool_engine.discover()
+            tool_engine.print_schemas(raw=False)
 
-            engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, agent=agent)
+            engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
 
             Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what is 12 plus 30?', "
                         "'what do you see?', or 'play the bye gesture'. '/mem' shows memory "
@@ -118,7 +118,7 @@ async def main():
     finally:
         user_requester.close()
         robot_requester.close()
-        user_agents.terminate(timeout=1.0)
+        user_tools.terminate(timeout=1.0)
         robot.close()
         memory.flush_all()
 

@@ -1,6 +1,7 @@
 """
-agent.py - Agent: merges tools from one or more MCP clients (robot, user-defined, ...)
-into a single OpenAI-compatible tool schema, with concurrent, error-safe dispatch.
+tool_engine.py - ToolEngine: merges tools from one or more MCP clients (robot,
+user-defined, ...) into a single OpenAI-compatible tool schema, with concurrent,
+error-safe dispatch.
 
 The tool schema list and the dispatch table are built from the same discovery pass,
 so the LLM can never be offered a tool we can't actually route a call to.
@@ -14,7 +15,7 @@ from fastmcp.exceptions import ToolError
 from luxai.magpie.utils import Logger
 
 
-class Agent:
+class ToolEngine:
 
     def __init__(self, sources: dict, whitelists: dict = None, retries: int = 1):
         """
@@ -57,7 +58,7 @@ class Agent:
 
         self._tools = tools
         self._schemas = schemas
-        Logger.info(f"Agent: discovered {len(tools)} tools: {sorted(tools)}")
+        Logger.info(f"ToolEngine: discovered {len(tools)} tools: {sorted(tools)}")
 
     def schemas(self) -> list[dict]:
         return self._schemas
@@ -108,7 +109,7 @@ class Agent:
                 return self._error_result(tool_call_id, str(e))
             except Exception as e:
                 last_error = e
-                Logger.debug(f"Agent: '{name}' attempt {attempt + 1} failed: {e}")
+                Logger.debug(f"ToolEngine: '{name}' attempt {attempt + 1} failed: {e}")
 
         return self._error_result(tool_call_id, f"call failed after {self._retries + 1} attempts: {last_error}")
 

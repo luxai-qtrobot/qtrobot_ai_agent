@@ -1,10 +1,10 @@
 """
 llm_engine.py - LLMEngine: reusable glue between an OpenAI-compatible client, an
-optional RobotMemory, and an optional Agent (MCP tool-calling).
+optional RobotMemory, and an optional ToolEngine (MCP tool-calling).
 
-Owns the round-loop mechanics (stream -> check tool_calls -> execute via Agent -> feed
-results back -> repeat until a round has no more tool_calls) and memory bookkeeping, so
-callers don't re-implement it per script. Does NOT decide what to do with the model's
+Owns the round-loop mechanics (stream -> check tool_calls -> execute via ToolEngine ->
+feed results back -> repeat until a round has no more tool_calls) and memory bookkeeping,
+so callers don't re-implement it per script. Does NOT decide what to do with the model's
 output (speak it, log it, etc.) - that's presentation logic and stays with the caller.
 ask() yields each complete sentence as it's produced, not per-round or per-token, so a
 caller wanting low-latency TTS can start speaking sentence 1 while the model is still
@@ -31,20 +31,20 @@ def extract_sentences(buffer: str):
 
 class LLMEngine:
 
-    def __init__(self, client, model: str, memory=None, agent=None, system_prompt: str = None):
+    def __init__(self, client, model: str, memory=None, tool_engine=None, system_prompt: str = None):
         """
         client:        a (sync) OpenAI client.
         model:         model name passed to every completion call.
         memory:        a RobotMemory instance, or None to fall back to a plain in-memory
                        history list (seeded with system_prompt, if given).
-        agent:         an Agent instance for MCP tool-calling, or None for plain chat
+        tool_engine:   a ToolEngine instance for MCP tool-calling, or None for plain chat
                        (no tools=, no tool-call handling).
         system_prompt: only used when memory is None, to seed the fallback history.
         """
         self.client = client
         self.model = model
         self.memory = memory
-        self.agent = agent
+        self.tool_engine = tool_engine
         self._history = [{"role": "system", "content": system_prompt}] if (memory is None and system_prompt) else []
 
     async def ask(self, user_input: str):
@@ -78,7 +78,7 @@ class LLMEngine:
             for tc in tool_calls:
                 Logger.info(f"[tool call] {tc['name']}({tc['arguments']})")
 
-            results = await self.agent.execute(tool_calls)
+            results = await self.tool_engine.execute(tool_calls)
             for r in results:
                 Logger.info(f"[tool result] {r['content']}")
                 self._add({
@@ -110,13 +110,13 @@ class LLMEngine:
     def _stream_round(self, messages: list, label: str = ""):
         """Sync generator: yields each complete sentence as it streams in. Returns
         (assistant_message, tool_calls) via StopIteration.value once the round ends -
-        tool_calls is the flat [{'id','name','arguments'}, ...] shape Agent.execute()
+        tool_calls is the flat [{'id','name','arguments'}, ...] shape ToolEngine.execute()
         expects; assistant_message is the OpenAI-format message ready for memory/history."""
         stream = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            tools=self.agent.schemas() if self.agent else None,
-            tool_choice="auto" if self.agent else None,
+            tools=self.tool_engine.schemas() if self.tool_engine else None,
+            tool_choice="auto" if self.tool_engine else None,
             stream=True,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
