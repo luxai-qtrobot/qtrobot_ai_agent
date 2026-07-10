@@ -9,3 +9,4 @@ simplejpeg
 openai
 numpy
 tiktoken
+fastembed

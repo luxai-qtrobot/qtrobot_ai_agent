@@ -23,6 +23,7 @@ import threading
 from luxai.magpie.utils import Logger
 
 from .base import ShortTermMemoryBase
+from .message_utils import raw_excerpt
 
 DEFAULT_SUMMARY_PROMPT = (
     "You are a memory summarizer for a robot's conversation. Update the running summary "
@@ -93,7 +94,7 @@ class ShortTermMemory(ShortTermMemoryBase):
             pending_batches = [messages for messages, thread in self._pending if thread.is_alive()]
 
         parts = [summary] if summary else []
-        parts.extend(self._raw_excerpt(m) for m in pending_batches)
+        parts.extend(raw_excerpt(m) for m in pending_batches)
 
         if not parts:
             return ""
@@ -113,7 +114,7 @@ class ShortTermMemory(ShortTermMemoryBase):
     # ------------------------------------------------------------------
 
     def _summarize(self, messages: list[dict]) -> None:
-        excerpt = self._raw_excerpt(messages)
+        excerpt = raw_excerpt(messages)
         with self._lock:
             current_summary = self._summary
         prompt = DEFAULT_SUMMARY_PROMPT.format(
@@ -149,15 +150,3 @@ class ShortTermMemory(ShortTermMemoryBase):
                 Logger.debug(f"[ShortTermMemory] summarization attempt {attempt + 1} failed: {e}")
         Logger.debug(f"[ShortTermMemory] summarization failed after {self.retries + 1} attempts: {last_error}")
         return ""
-
-    @staticmethod
-    def _raw_excerpt(messages: list[dict]) -> str:
-        lines = []
-        for m in messages:
-            role = m.get("role", "?")
-            content = m.get("content")
-            if isinstance(content, str):
-                lines.append(f"{role}: {content}")
-            elif isinstance(content, list):
-                lines.append(f"{role}: <non-text content>")
-        return "\n".join(lines)

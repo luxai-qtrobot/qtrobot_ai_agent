@@ -76,11 +76,11 @@ class LLMEngine:
                 break
 
             for tc in tool_calls:
-                Logger.info(f"[tool call] {tc['name']}({tc['arguments']})")
+                Logger.debug(f"[tool call] {tc['name']}({tc['arguments']})")
 
             results = await self.tool_engine.execute(tool_calls)
             for r in results:
-                Logger.info(f"[tool result] {r['content']}")
+                Logger.debug(f"[tool result] {r['content']}")
                 self._add({
                     "role": "tool",
                     "tool_call_id": r["tool_call_id"],

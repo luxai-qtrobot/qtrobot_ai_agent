@@ -1,11 +1,11 @@
 """
-user_tools.py - User-defined tools, served as a local MCP server over ZMQ inproc.
+user_tools.py - User-defined tools: get_datetime, get_image.
 
-UserTools *is* the server node: it holds an already-connected Robot instance
-(connected + plugin-enabled by the caller), registers its own bound methods as MCP tools
-(schemas derived from each method's signature + docstring via McpSchema, no hand-written
-JSON schema), and manages its own responder/thread lifecycle via ServerNode. Add new user
-tools here as methods, registered in __init__ before super().__init__() runs.
+A ToolBase provider, not its own MCP server - it registers its bound methods (schemas
+derived from each method's signature + docstring via McpSchema, no hand-written JSON
+schema) onto a schema handed to it by a shared LocalToolServer (local_tool_server.py),
+so adding a new tool group never means standing up another ServerNode/responder/
+endpoint. Add new user tools here as methods, registered in register().
 """
 
 import base64
@@ -14,33 +14,25 @@ from datetime import datetime
 import numpy as np
 from simplejpeg import encode_jpeg
 
-from luxai.magpie.nodes import ServerNode
 from luxai.magpie.schema import McpSchema
-from luxai.magpie.transport import ZMQRpcResponder
 from luxai.magpie.utils import Logger
 
-USER_TOOLS_ENDPOINT = "inproc://user-tools"
+from .tool_base import ToolBase
 
 
-class UserTools(ServerNode):
+class UserTools(ToolBase):
 
     def __init__(self, robot):
         self.robot = robot
-        self.schema = McpSchema(name="user-tools", version="1.0.0")
         self._camera_reader = None  # lazily opened on first get_image() call, kept open after
 
-        self.schema.method()(self.get_datetime)
-        self.schema.method()(self.get_image)
-
-        # Tools must be registered above before this runs - BaseNode.__init__() starts
-        # the request-handling thread as its very last step.
-        responder = ZMQRpcResponder(USER_TOOLS_ENDPOINT, schema=self.schema)
-        super().__init__(name="user-tools-server", responder=responder)
+    def register(self, schema: McpSchema) -> None:
+        schema.method()(self.get_datetime)
+        schema.method()(self.get_image)
 
     def get_datetime(self) -> str:
         """Get the current date and time."""
         return datetime.now().strftime("%A, %Y-%m-%d %H:%M:%S")
-
 
     def get_image(self) -> dict:
         """Capture a single color image from the robot's camera, for visual questions
@@ -64,12 +56,11 @@ class UserTools(ServerNode):
         return {"mimeType": "image/jpeg", "data": base64.b64encode(jpeg_bytes).decode("ascii")}
 
     def cleanup(self) -> None:
-        """Close the camera reader (if ever opened) before the usual ServerNode cleanup
-        (executor shutdown + responder close)."""
+        """Close the camera reader (if ever opened) - called by LocalToolServer.cleanup()
+        for every provider it holds."""
         if self._camera_reader is not None:
             try:
                 self._camera_reader.close()
             except Exception as e:
-                Logger.warning(f"{self.name}: error closing camera reader: {e}")
+                Logger.warning(f"user-tools: error closing camera reader: {e}")
             self._camera_reader = None
-        super().cleanup()

@@ -20,7 +20,9 @@ class RobotMemory:
                     call, it never deletes anything from working/short_term's own stores.
         working:    a WorkingMemory instance (required).
         short_term: a ShortTermMemory instance, or None to skip that tier.
-        long_term:  reserved for later - not implemented yet.
+        long_term:  a LongTermMemory instance, or None to skip that tier - archived chat
+                    history and loaded documents both live there (see
+                    memory/long_term_memory.py).
         """
         self.static = static
         self.max_tokens = max_tokens
@@ -55,6 +57,15 @@ class RobotMemory:
         """Assemble static + working's raw messages + short_term summary into the final
         list ready to hand to client.chat.completions.create(messages=...)."""
         messages = [{"role": "system", "content": self.static}]
+
+        # Right after static, not buried mid-conversation or tacked onto the end like
+        # STM's summary: this is stable/instructional (which documents exist and are
+        # searchable), not a per-turn narrative, so it belongs with the other front-
+        # loaded instructions the model attends to most reliably.
+        doc_index = self.long_term.document_index_summary() if self.long_term is not None else ""
+        if doc_index:
+            messages.append({"role": "system", "content": doc_index})
+
         messages.extend(self.working.get())
 
         # Appended last, not right after static: models attend most reliably to the
@@ -79,6 +90,8 @@ class RobotMemory:
         self.working.flush()
         if self.short_term is not None:
             self.short_term.flush()
+        if self.long_term is not None:
+            self.long_term.flush()
 
     def print(self, raw: bool = False) -> None:
         """Debug helper for a '/mem' command - pretty-prints (or raw=True dumps the exact
@@ -127,10 +140,15 @@ class RobotMemory:
         if count_messages_tokens(messages) <= self.max_tokens:
             return messages
 
-        static_msg = messages[0]
+        # static, plus the doc index right after it if present (see get()) - both are
+        # stable/instructional, never trimmed, same as static always was.
+        has_doc_index = self.long_term is not None and self.long_term.document_index_summary() != ""
+        lead_count = 2 if has_doc_index else 1
+        lead_msgs = messages[:lead_count]
+
         has_summary = self.short_term is not None and self.short_term.get() != ""
         summary_msg = messages[-1] if has_summary else None
-        working_msgs = messages[1:-1] if has_summary else messages[1:]
+        working_msgs = messages[lead_count:-1] if has_summary else messages[lead_count:]
 
         # The current, still-open turn is never trimmed - same protection WorkingMemory's
         # own eviction gives it, applied here too so the read path can't reintroduce the
@@ -139,7 +157,7 @@ class RobotMemory:
         protected = working_msgs[boundary:]
         trimmable = working_msgs[:boundary]
 
-        budget = self.max_tokens - count_message_tokens(static_msg) - count_messages_tokens(protected)
+        budget = self.max_tokens - count_messages_tokens(lead_msgs) - count_messages_tokens(protected)
 
         if summary_msg is not None:
             summary_cost = count_message_tokens(summary_msg)
@@ -161,7 +179,7 @@ class RobotMemory:
             kept.insert(0, msg)
             budget -= cost
 
-        result = [static_msg]
+        result = list(lead_msgs)
         result.extend(kept)
         result.extend(protected)
         if summary_msg is not None:
