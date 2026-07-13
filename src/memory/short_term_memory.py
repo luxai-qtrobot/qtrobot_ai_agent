@@ -23,7 +23,7 @@ import threading
 from luxai.magpie.utils import Logger
 
 from .base import ShortTermMemoryBase
-from .message_utils import raw_excerpt
+from .utils import raw_excerpt
 
 DEFAULT_SUMMARY_PROMPT = (
     "You are a memory summarizer for a robot's conversation. Update the running summary "

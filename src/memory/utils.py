@@ -1,10 +1,11 @@
 """
-token_utils.py - Approximate token counting for memory budget accounting.
+utils.py - Shared helpers used across memory tiers: message-text rendering and
+approximate token counting.
 
-Uses tiktoken as a reasonable approximation - it won't exactly match gemma's own
-tokenizer, but this is a soft budget (for latency/perf tuning), not a hard
-model-imposed ceiling, so exact precision isn't required. Falls back to a
-chars/4 heuristic if tiktoken isn't installed.
+Token counting uses tiktoken as a reasonable approximation - it won't exactly match
+gemma's own tokenizer, but this is a soft budget (for latency/perf tuning), not a hard
+model-imposed ceiling, so exact precision isn't required. Falls back to a chars/4
+heuristic if tiktoken isn't installed.
 """
 
 import json
@@ -19,6 +20,21 @@ except ImportError:
 # of resolution - counting the raw base64 string length would wildly overestimate
 # (a 100k-char data URL is not 100k/4 tokens once it reaches the model).
 IMAGE_TOKEN_ESTIMATE = 300
+
+
+def raw_excerpt(messages: list[dict]) -> str:
+    """Renders chat messages as plain text, for handing raw conversation content to an
+    LLM call or an embedding model (which only take plain text, not the OpenAI message
+    shape)."""
+    lines = []
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content")
+        if isinstance(content, str):
+            lines.append(f"{role}: {content}")
+        elif isinstance(content, list):
+            lines.append(f"{role}: <non-text content>")
+    return "\n".join(lines)
 
 
 def count_tokens(text: str) -> int:

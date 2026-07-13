@@ -7,7 +7,7 @@ know about or apply any of these rules - they're all internal invariants of this
 """
 
 from .base import WorkingMemoryBase
-from .token_utils import count_messages_tokens
+from .utils import count_messages_tokens
 
 # How much detail to keep in a compacted tool-result summary line (name(args) -> result).
 # Long tool results (e.g. a full gesture list) get truncated here, not dropped entirely.

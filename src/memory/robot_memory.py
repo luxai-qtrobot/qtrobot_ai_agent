@@ -7,7 +7,7 @@ their own local, ratio-derived budgets and are otherwise self-contained; they ne
 runtime awareness of each other or of the parent.
 """
 
-from .token_utils import count_message_tokens, count_messages_tokens
+from .utils import count_message_tokens, count_messages_tokens
 
 
 class RobotMemory:

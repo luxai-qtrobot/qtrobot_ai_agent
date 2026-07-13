@@ -10,3 +10,4 @@ openai
 numpy
 tiktoken
 fastembed
+pypdf

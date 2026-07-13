@@ -31,6 +31,7 @@ from tool.local_tool_server import LOCAL_TOOLS_ENDPOINT, LocalToolServer
 from tool.user_tools import UserTools
 from tool.memory_tools import MemoryTools
 from llm.llm_engine import LLMEngine
+from memory.document_reader import DirectoryReader
 from memory.long_term_memory import LongTermMemory
 from memory.robot_memory import RobotMemory
 from memory.short_term_memory import ShortTermMemory
@@ -59,6 +60,7 @@ LLM_MODEL = "gemma-4-12B-it-Q8_0.gguf"
 MEMORY_MAX_TOKENS = 31000  # 31k
 
 DOCUMENTS_DIR = Path(__file__).resolve().parent.parent / "documents"
+LTM_CHAT_HISTORY_PATH = Path(__file__).resolve().parent.parent / "data" / "long_term_chat_history.json"
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant. Use the available tools when they let you answer "
@@ -76,25 +78,11 @@ SYSTEM_PROMPT = (
 )
 
 
-DOCUMENTS = {
-    "qtrobot_information.txt": "Overview of QTrobot products (Research, School, Home), "
-                                "hardware variants, and SDK/Studio programming options.",
-    "qtrobot_research_papers.txt": "List of 40+ published research papers using QTrobot, "
-                                    "with abstracts, covering autism therapy, education, "
-                                    "healthcare, and assistive-robotics studies.",
-}
-
-
-def _load_documents(long_term: LongTermMemory) -> None:
-    """Loads the fixed set of reference documents into long-term memory at startup.
-    Plain .txt for now, read whole - chunking/embedding happens inside add_document()
-    on a background thread, so this call doesn't block startup. Parsing other formats
-    (pdf, docx, ...) is a separate, not-yet-built concern."""
-    for filename, summary in DOCUMENTS.items():
-        path = DOCUMENTS_DIR / filename
-        text = path.read_text(encoding="utf-8")
-        long_term.add_document(source=path.name, text=text, summary=summary)
-        Logger.info(f"Loaded document into long-term memory: {path.name}")
+DOCUMENTS_SUMMARY = (
+    "QTrobot product/hardware overview (Research, School, Home variants, SDK/Studio "
+    "programming options), and a list of 40+ published research papers using QTrobot "
+    "with abstracts (autism therapy, education, healthcare, assistive robotics)."
+)
 
 
 async def main():
@@ -108,7 +96,11 @@ async def main():
 
     # Robot memmory
     long_term = LongTermMemory()
-    _load_documents(long_term)
+    long_term.load(LTM_CHAT_HISTORY_PATH)
+
+    for doc in DirectoryReader.read(DOCUMENTS_DIR, summary=DOCUMENTS_SUMMARY):
+        long_term.add_document(text=doc.text, summary=doc.summary, meta=doc.meta)
+        Logger.info(f"Loaded document into long-term memory: {doc.meta['source']}")
     memory = RobotMemory(
         static=SYSTEM_PROMPT,
         max_tokens=MEMORY_MAX_TOKENS,
@@ -163,6 +155,7 @@ async def main():
         local_tool_server.terminate(timeout=1.0)
         robot.close()
         memory.flush_all()
+        long_term.save(LTM_CHAT_HISTORY_PATH)
 
 
 if __name__ == "__main__":

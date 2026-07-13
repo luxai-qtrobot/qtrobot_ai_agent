@@ -13,25 +13,31 @@ doesn't touch the llama.cpp chat server at all. Kept off the hot path: add() alw
 returns immediately and does the actual embed+store on a background thread, the same
 pattern ShortTermMemory uses for its own summarization calls.
 
-Vector search is plain NumPy brute-force cosine similarity - fine at the scale this is
-built for; swap in hnswlib/chromadb later only if that stops being true.
+Vector search is plain NumPy brute-force cosine similarity, followed by a cross-encoder
+rerank pass (see search()) - fine at the scale this is built for; swap in hnswlib/
+chromadb for stage 1 later only if that stops being true.
 """
 
+import json
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from fastembed import TextEmbedding
+from fastembed.rerank.cross_encoder import TextCrossEncoder
 
 from luxai.magpie.utils import Logger
 
-from .message_utils import raw_excerpt
+from .utils import raw_excerpt
 
 CHAT_KIND = "chat"
 DOCUMENT_KIND = "document"
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+RERANK_POOL_SIZE = 20  # candidates handed to the reranker before cutting down to top_k
 
 # Structured relative-time buckets accepted by search()'s time_hint - deliberately not
 # freeform NL parsing (no extra dependency, and this is what models naturally reach
@@ -49,14 +55,18 @@ class _Record:
 
 class LongTermMemory:
 
-    def __init__(self, model_name: str = DEFAULT_MODEL, chunk_chars: int = 1000, chunk_overlap: int = 100):
+    def __init__(self, model_name: str = DEFAULT_MODEL, rerank_model: str = DEFAULT_RERANK_MODEL,
+                 chunk_chars: int = 1000, chunk_overlap: int = 100):
         """
-        model_name:    fastembed text embedding model.
+        model_name:    fastembed text embedding model (stage 1: cheap recall).
+        rerank_model:  fastembed cross-encoder model (stage 2: precise reranking of the
+                       stage-1 candidate pool - see search()).
         chunk_chars:   max characters per chunk when splitting a document for indexing.
         chunk_overlap: characters shared between consecutive chunks, so a fact sitting
                        right on a chunk boundary isn't cut in half in every chunk.
         """
         self._embedder = TextEmbedding(model_name=model_name)
+        self._reranker = TextCrossEncoder(model_name=rerank_model)
         self.chunk_chars = chunk_chars
         self.chunk_overlap = chunk_overlap
 
@@ -64,7 +74,7 @@ class LongTermMemory:
         self._vectors: np.ndarray = None  # (N, D), L2-normalized rows
         self._records: list[_Record] = []
         self._pending: list[threading.Thread] = []
-        self._documents: dict[str, str] = {}  # source name -> brief description
+        self._documents: list[str] = []  # distinct summaries, dedup'd - see add_document()
 
     # ------------------------------------------------------------------
     # Chat archival - wired via RobotMemory._on_short_term_evict
@@ -84,27 +94,34 @@ class LongTermMemory:
     # already-extracted text.
     # ------------------------------------------------------------------
 
-    def add_document(self, source: str, text: str, summary: str = "") -> None:
-        """source:  short identifier (e.g. filename) - also shown in search results.
-        text:    full extracted document text, chunked internally before indexing.
-        summary: one-line description surfaced via document_index_summary(), so the
-                 LLM knows this document exists and roughly what it covers without
-                 spending a search_documents() call just to discover that."""
+    def add_document(self, text: str, summary: str = "", meta: dict = None) -> None:
+        """text:    full extracted document text, chunked internally before indexing.
+        summary: one-line description surfaced via document_index_summary(), so the LLM
+                 knows what's available before spending a search_documents() call to
+                 find out. Distinct summaries only - loading many files under the same
+                 shared summary (e.g. via DirectoryReader) collapses to one line.
+        meta:    optional free-form per-chunk metadata (e.g. {"source": "file.txt",
+                 "path": ..., "modified": ...} - see document_reader.py), passed through
+                 unchanged to every chunk's record. search_documents() results show
+                 whatever's present (e.g. "source", for citation) - nothing is required."""
+        resolved_summary = summary or (text[:200].strip() + "...")
         with self._lock:
-            self._documents[source] = summary or (text[:200].strip() + "...")
+            if resolved_summary not in self._documents:
+                self._documents.append(resolved_summary)
 
+        meta = meta or {}
         for chunk in self._chunk_text(text):
-            self._store_async(chunk, DOCUMENT_KIND, {"source": source})
+            self._store_async(chunk, DOCUMENT_KIND, meta)
 
     def document_index_summary(self) -> str:
-        """Always-on list of loaded documents (name + brief description) - lets the LLM
-        know search_documents() is worth calling, and roughly what it'll find, without a
-        tool round trip just to discover that. Empty string if nothing is loaded."""
+        """Always-on list of distinct document summaries - lets the LLM know
+        search_documents() is worth calling, and roughly what it'll find, without a tool
+        round trip just to discover that. Empty string if nothing is loaded."""
         with self._lock:
-            documents = dict(self._documents)
-        if not documents:
+            summaries = list(self._documents)
+        if not summaries:
             return ""
-        lines = [f"- {name}: {summary}" for name, summary in documents.items()]
+        lines = [f"- {s}" for s in summaries]
         return "[Documents loaded and searchable via search_documents()]:\n" + "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -112,10 +129,15 @@ class LongTermMemory:
     # ------------------------------------------------------------------
 
     def search(self, query: str, top_k: int = 5, kind: str = None, time_hint: str = None) -> list[dict]:
-        """Embeds query, cosine-ranks against the store, optionally filtered by kind
+        """Two-stage retrieve-then-rerank, optionally filtered by kind
         (CHAT_KIND/DOCUMENT_KIND) and/or a structured time_hint bucket (see TIME_HINTS -
-        chat records only; documents have no meaningful "when"). Returns
-        [{"text", "kind", "meta", "when"}, ...] most-similar first - "when" is rendered
+        chat records only; documents have no meaningful "when"). Stage 1 is a cheap
+        cosine pass over the whole (filtered) store that casts a wide net - fast, but
+        easily fooled by chunks that just share vocabulary with the query. Stage 2 runs
+        a cross-encoder over that shortlist, scoring query+chunk jointly for real
+        relevance, and only that final ranking decides what's returned - too slow to run
+        over the whole store, cheap over a short pool. Returns
+        [{"text", "kind", "meta", "when"}, ...] most-relevant first - "when" is rendered
         relative to now (e.g. "3 days ago"), not a raw timestamp, since that's what the
         model can actually reason with."""
         with self._lock:
@@ -138,18 +160,23 @@ class LongTermMemory:
         query_vec = self._embed([query])[0]
         candidates = [r for r, keep in zip(records, mask) if keep]
         sims = vectors[mask] @ query_vec
-        order = np.argsort(-sims)[:top_k]
+
+        pool_size = min(RERANK_POOL_SIZE, len(candidates))
+        pool = [candidates[i] for i in np.argsort(-sims)[:pool_size]]
+
+        rerank_scores = list(self._reranker.rerank(query, [r.text for r in pool]))
+        ranked = [pool[i] for i in np.argsort(-np.array(rerank_scores))[:top_k]]
 
         return [
             {
-                "text": candidates[i].text,
-                "kind": candidates[i].kind,
-                "meta": candidates[i].meta,
+                "text": r.text,
+                "kind": r.kind,
+                "meta": r.meta,
                 # Only chat has a meaningful "when" - a document's embed-time timestamp
                 # says nothing about the document itself, so don't present it as one.
-                "when": self._relative_time(candidates[i].timestamp) if candidates[i].kind == CHAT_KIND else None,
+                "when": self._relative_time(r.timestamp) if r.kind == CHAT_KIND else None,
             }
-            for i in order
+            for r in ranked
         ]
 
     def flush(self) -> None:
@@ -159,6 +186,45 @@ class LongTermMemory:
             threads = list(self._pending)
         for thread in threads:
             thread.join()
+
+    # ------------------------------------------------------------------
+    # Persistence - chat history only. Documents are never persisted: they're cheap to
+    # reindex from source files every run (see document_reader.py), and re-embedding on
+    # load (rather than trusting stored vectors) means an old save file can never go
+    # silently stale if the embedding model is ever changed later.
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Writes archived chat records as plain, human-readable JSON (text/timestamp/
+        meta - no vectors), so the file doubles as a readable chat log a user can open
+        or hand-edit, not just a technical cache."""
+        with self._lock:
+            records = [
+                {"text": r.text, "timestamp": r.timestamp, "meta": r.meta}
+                for r in self._records if r.kind == CHAT_KIND
+            ]
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        Logger.info(f"[LongTermMemory] saved {len(records)} chat record(s) to {path}")
+
+    def load(self, path: str) -> None:
+        """Reindexes chat history written by save() - every record is re-embedded fresh
+        rather than trusting old vectors (see class docstring above for why). No-op if
+        the file doesn't exist yet (e.g. first run)."""
+        in_path = Path(path)
+        if not in_path.exists():
+            return
+        records = json.loads(in_path.read_text(encoding="utf-8"))
+        if not records:
+            return
+
+        vectors = self._embed([r["text"] for r in records])
+        with self._lock:
+            for r, vec in zip(records, vectors):
+                self._records.append(_Record(text=r["text"], kind=CHAT_KIND, meta=r["meta"], timestamp=r["timestamp"]))
+            self._vectors = vectors if self._vectors is None else np.vstack([self._vectors, vectors])
+        Logger.info(f"[LongTermMemory] loaded {len(records)} chat record(s) from {path}")
 
     # ------------------------------------------------------------------
     # Internal
