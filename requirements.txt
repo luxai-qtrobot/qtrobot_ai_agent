@@ -11,3 +11,5 @@ numpy
 tiktoken
 fastembed
 pypdf
+tavily-python
+trafilatura

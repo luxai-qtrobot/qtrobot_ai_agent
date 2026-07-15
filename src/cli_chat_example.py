@@ -36,6 +36,7 @@ from memory.long_term_memory import LongTermMemory
 from memory.robot_memory import RobotMemory
 from memory.short_term_memory import ShortTermMemory
 from memory.working_memory import WorkingMemory
+from agents.agent_registry import AgentRegistry
 
 ROBOT_IP = "192.168.3.111"
 ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
@@ -79,6 +80,10 @@ SYSTEM_PROMPT = (
     "acknowledgments are: 'Sure, one moment.' 'Let me check.' or 'I will play a happy "
     "gesture.' Never wait until after the action to acknowledge it. "
 
+    "An acknowledgment by itself is never a complete response - if you say you will "
+    "check, look up, play, or perform something, the matching tool call must be in "
+    "that same turn too. Never stop right after the acknowledgment with no tool call. "
+
     "After a successful action, do not repeat what you already announced. Only speak "
     "again if the result needs to be reported, the action failed, or the user needs "
     "additional information. "
@@ -121,6 +126,7 @@ async def main():
     for doc in DirectoryReader.read(DOCUMENTS_DIR, summary=DOCUMENTS_SUMMARY):
         long_term.add_document(text=doc.text, summary=doc.summary, meta=doc.meta)
         Logger.info(f"Loaded document into long-term memory: {doc.meta['source']}")
+        
     memory = RobotMemory(
         static=SYSTEM_PROMPT,
         max_tokens=MEMORY_MAX_TOKENS,
@@ -129,16 +135,23 @@ async def main():
         long_term=long_term,
     )
 
+    # enable agents 
+    agents = AgentRegistry(client, LLM_MODEL)
+
     local_tool_server = LocalToolServer([
-        UserTools(robot), 
-        MemoryTools(long_term)
+        UserTools(robot),
+        MemoryTools(long_term),
+        *agents.as_tools(),
         ])
     local_requester = ZMQRpcRequester(LOCAL_TOOLS_ENDPOINT)
     robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
 
     try:
         async with (
-            Client(McpTransport(local_requester)) as local_client,
+            # 120s, not the 30s default - the "local" source includes agent-as-tool
+            # calls (e.g. search_web), which run a whole nested multi-round LLM
+            # conversation and can legitimately take longer than a plain tool call.
+            Client(McpTransport(local_requester, timeout=120.0)) as local_client,
             Client(McpTransport(robot_requester)) as robot_client,
         ):
             tool_engine = ToolEngine(
@@ -148,7 +161,7 @@ async def main():
             await tool_engine.discover()
             # tool_engine.print_schemas(raw=False)
 
-            engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
+            llm_engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
 
             Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what do you see?', "                        
                         "'/mem' shows memory ('/mem raw' for raw json memory), '/exit' close the chat.")
@@ -165,13 +178,14 @@ async def main():
                     memory.print(raw=True)
                     continue
 
-                async for text in engine.ask(user_input):
+                async for text in llm_engine.ask(user_input):
                     Logger.info(f"[SPEAK] {text}")
                     # handle = robot.tts.say_text_async(text, voice="Rosie")
     finally:
         local_requester.close()
         robot_requester.close()
         local_tool_server.terminate(timeout=1.0)
+        agents.cleanup()
         robot.close()
         memory.flush_all()
         long_term.save(LTM_CHAT_HISTORY_PATH)
