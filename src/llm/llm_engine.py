@@ -31,7 +31,8 @@ def extract_sentences(buffer: str):
 
 class LLMEngine:
 
-    def __init__(self, client, model: str, memory=None, tool_engine=None, system_prompt: str = None):
+    def __init__(self, client, model: str, memory=None, tool_engine=None, system_prompt: str = None,
+                 max_tokens: int = 800, timeout: float = 60.0):
         """
         client:        a (sync) OpenAI client.
         model:         model name passed to every completion call.
@@ -40,11 +41,21 @@ class LLMEngine:
         tool_engine:   a ToolEngine instance for MCP tool-calling, or None for plain chat
                        (no tools=, no tool-call handling).
         system_prompt: only used when memory is None, to seed the fallback history.
+        max_tokens:    hard cap on generated tokens per round - guards against a runaway
+                       generation (e.g. the model looping on a reasoning/think tag and
+                       never emitting real content) hanging the whole conversation.
+                       Normal spoken replies are far shorter than this.
+        timeout:       per-round call timeout (seconds) - guards against a genuinely
+                       stalled connection. Separate concern from max_tokens: a looping
+                       generation still streams bytes continuously, so it wouldn't trip
+                       an idle read timeout on its own - max_tokens is what bounds that.
         """
         self.client = client
         self.model = model
         self.memory = memory
         self.tool_engine = tool_engine
+        self.max_tokens = max_tokens
+        self.timeout = timeout
         self._history = [{"role": "system", "content": system_prompt}] if (memory is None and system_prompt) else []
 
     async def ask(self, user_input: str):
@@ -112,43 +123,54 @@ class LLMEngine:
         (assistant_message, tool_calls) via StopIteration.value once the round ends -
         tool_calls is the flat [{'id','name','arguments'}, ...] shape ToolEngine.execute()
         expects; assistant_message is the OpenAI-format message ready for memory/history."""
-        stream = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=self.tool_engine.schemas() if self.tool_engine else None,
-            tool_choice="auto" if self.tool_engine else None,
-            stream=True,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
-
         buffer = ""
         content = ""
         tool_calls_acc = {}  # index -> {"id": str, "name": str, "arguments": str}
 
-        # Logger.debug(f"--- streaming deltas ({label}) ---")
-        for chunk in stream:
-            delta = chunk.choices[0].delta
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=self.tool_engine.schemas() if self.tool_engine else None,
+                tool_choice="auto" if self.tool_engine else None,
+                stream=True,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
 
-            if delta.content:
-                content += delta.content
-                buffer += delta.content
-                sentences, buffer = extract_sentences(buffer)
-                for sentence in sentences:
-                    if sentence:
-                        yield sentence
+            # Logger.debug(f"--- streaming deltas ({label}) ---")
+            for chunk in stream:
+                delta = chunk.choices[0].delta
 
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    acc = tool_calls_acc.setdefault(tc.index, {"id": None, "name": None, "arguments": ""})
-                    if tc.id:
-                        acc["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        acc["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        acc["arguments"] += tc.function.arguments
-                    Logger.debug(f"[tool_call delta] index={tc.index} id={tc.id} "
-                                 f"name={tc.function.name if tc.function else None} "
-                                 f"args_fragment={tc.function.arguments if tc.function else None!r}")
+                if delta.content:
+                    content += delta.content
+                    buffer += delta.content
+                    sentences, buffer = extract_sentences(buffer)
+                    for sentence in sentences:
+                        if sentence:
+                            yield sentence
+
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        acc = tool_calls_acc.setdefault(tc.index, {"id": None, "name": None, "arguments": ""})
+                        if tc.id:
+                            acc["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            acc["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            acc["arguments"] += tc.function.arguments
+                        Logger.debug(f"[tool_call delta] index={tc.index} id={tc.id} "
+                                     f"name={tc.function.name if tc.function else None} "
+                                     f"args_fragment={tc.function.arguments if tc.function else None!r}")
+        except Exception as e:
+            # A genuinely stalled connection (timeout=) lands here - a runaway/looping
+            # generation is instead bounded by max_tokens= and ends the stream normally,
+            # so it never reaches this branch at all.
+            Logger.warning(f"LLMEngine: streaming call failed ({label}): {e}")
+            fallback = "Sorry, I'm having trouble responding right now."
+            yield fallback
+            return {"role": "assistant", "content": fallback}, []
 
         leftover = buffer.strip()
         if leftover:

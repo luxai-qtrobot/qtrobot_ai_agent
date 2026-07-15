@@ -23,8 +23,9 @@ from .tool_base import ToolBase
 class UserTools(ToolBase):
 
     def __init__(self, robot):
-        self.robot = robot
-        self._camera_reader = None  # lazily opened on first get_image() call, kept open after
+        self.robot = robot        
+        self._camera_reader = self.robot.camera.stream.open_color_reader()
+
 
     def register(self, schema: McpSchema) -> None:
         schema.method()(self.get_datetime)
@@ -36,13 +37,8 @@ class UserTools(ToolBase):
 
     def get_image(self) -> dict:
         """Capture a single color image from the robot's camera, for visual questions
-        like 'what do you see?'. The reader is opened once (on first call) and kept open
-        - queue_size=1/delivery=latest means every read() still gets the current frame,
-        so there's no staleness cost, only savings from skipping subscribe/teardown on
-        every call."""
-        if self._camera_reader is None:
-            self._camera_reader = self.robot.camera.stream.open_color_reader()
-        frame = self._camera_reader.read(timeout=3.0)
+        like 'what do you see?'."""        
+        frame = self._camera_reader.read(timeout=2.0)
 
         # open_color_reader() is documented as always producing BGR - no need to trust
         # frame.pixel_format, which carries RealSense's raw format string ("BGR8").
@@ -53,6 +49,7 @@ class UserTools(ToolBase):
         # _mcp_tools_call) - there's no native "image" content type yet. This dict gets
         # JSON-serialized into that text block; ToolEngine._to_result() knows to unpack
         # this specific {mimeType, data} shape back into a real image for the LLM.
+        Logger.info(f"get_image: captured ({frame.width}, {frame.height})!")
         return {"mimeType": "image/jpeg", "data": base64.b64encode(jpeg_bytes).decode("ascii")}
 
     def cleanup(self) -> None:
