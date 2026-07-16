@@ -4,7 +4,15 @@ working_memory.py - WorkingMemory: raw, unsummarized recent chat history.
 Self-managed: image superseding and overflow eviction happen automatically on add();
 turn-boundary tool-result compaction happens on end_turn(). No external caller needs to
 know about or apply any of these rules - they're all internal invariants of this class.
+
+Lock-protected: LLMEngine's non-blocking tool dispatch means more than one thread can
+touch this at once now (the main worker processing a fresh turn, and a background
+thread resolving an earlier turn's parked tool call) - every public method acquires
+self._lock, internal helpers never re-acquire it (always called from an already-locked
+public method).
 """
+
+import threading
 
 from .base import WorkingMemoryBase
 from .utils import count_messages_tokens
@@ -29,6 +37,7 @@ class WorkingMemory(WorkingMemoryBase):
         self.max_tokens = None      # resolved by bind()
         self._on_evict = None       # resolved by bind()
 
+        self._lock = threading.Lock()
         self._messages: list[dict] = []
         self._turn_start = 0        # index into _messages where the current turn began
 
@@ -39,39 +48,66 @@ class WorkingMemory(WorkingMemoryBase):
         self._on_evict = on_evict
 
     def add(self, message: dict) -> None:
-        if self._has_image(message):
-            self._supersede_images()
-        self._messages.append(message)
-        self._evict_if_needed()
+        with self._lock:
+            if self._has_image(message):
+                self._supersede_images()
+            self._messages.append(message)
+            self._evict_if_needed()
+
+    def insert_after(self, anchor: dict, messages: list[dict]) -> None:
+        """Splices messages in right after anchor's current position, rather than
+        appending at the tail - used to commit a previously-parked tool call/result/
+        answer at its true chronological position (right after the question that
+        triggered it), even though it was only resolved later, after other turns may
+        have already been added. anchor is matched by identity (the exact message
+        object handed to add() earlier), since positions shift over time. Falls back to
+        appending at the end if anchor is no longer present (e.g. evicted in the
+        meantime) - better than silently dropping the content."""
+        with self._lock:
+            try:
+                index = next(i for i, m in enumerate(self._messages) if m is anchor)
+            except StopIteration:
+                self._messages.extend(messages)
+            else:
+                self._messages[index + 1:index + 1] = messages
+                if index + 1 <= self._turn_start:
+                    self._turn_start += len(messages)
+            self._evict_if_needed()
 
     def get(self) -> list[dict]:
-        return list(self._messages)
+        with self._lock:
+            return list(self._messages)
 
     def turn_boundary(self) -> int:
         """Index into get()'s returned list where the current, still-open turn begins.
         Messages at or after this index must never be evicted or trimmed away - RobotMemory
         uses this to protect them in its own read-time budget trim too."""
-        return self._turn_start
+        with self._lock:
+            return self._turn_start
 
     def end_turn(self) -> None:
         """Compact this turn's own tool_call/tool_result exchanges in place, now that the
         turn is fully resolved and no longer needs full detail for live in-turn reasoning
         (the LLM already used the raw result to answer - only future turns need less)."""
-        turn_messages = self._messages[self._turn_start:]
-        self._messages[self._turn_start:] = self._compact_tool_exchanges(turn_messages)
-        self._turn_start = len(self._messages)
+        with self._lock:
+            turn_messages = self._messages[self._turn_start:]
+            self._messages[self._turn_start:] = self._compact_tool_exchanges(turn_messages)
+            self._turn_start = len(self._messages)
 
-    def flush(self) -> None:
-        """Unconditionally hand off everything to short-term, bypassing the normal
-        overflow trigger. Called on shutdown so nothing is lost just because the session
-        ended before working memory happened to overflow."""
-        if self._messages and self._on_evict:
-            self._on_evict(self._messages)
-        self._messages = []
-        self._turn_start = 0
+    def flush(self, notify: bool = True) -> None:
+        """Unconditionally clears everything, bypassing the normal overflow trigger -
+        called on shutdown so nothing is lost just because the session ended before
+        working memory happened to overflow. notify=False skips the on_evict hand-off
+        (used on final exit, when the caller is archiving straight to long_term
+        instead - see RobotMemory.flush_all())."""
+        with self._lock:
+            if self._messages and self._on_evict and notify:
+                self._on_evict(self._messages)
+            self._messages = []
+            self._turn_start = 0
 
     # ------------------------------------------------------------------
-    # Internal invariants
+    # Internal invariants - always called with self._lock already held
     # ------------------------------------------------------------------
 
     @staticmethod

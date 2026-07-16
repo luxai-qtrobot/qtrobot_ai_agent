@@ -40,14 +40,15 @@ AGENT_TOOLS_ENDPOINT = "inproc://agent-tools"
 
 class AgentBase(ToolBase):
 
-    def __init__(self, client, model: str, whitelist: set, system_prompt: str,
+    def __init__(self, client, model: str, whitelist: dict, system_prompt: str,
                  endpoint: str = AGENT_TOOLS_ENDPOINT,
                  memory_max_tokens: int = 4000, max_tokens: int = 800, timeout: float = 60.0):
         """
         client:            a (sync) OpenAI client - shared with the main conversation's client.
         model:             model name passed to every completion call.
-        whitelist:         tool names on the agent-tools server belonging to this agent -
-                           scopes this agent's ToolEngine down to just its own tools.
+        whitelist:         {tool_name: cancel_tool_name | None} on the agent-tools server
+                           belonging to this agent - scopes this agent's ToolEngine down
+                           to just its own tools (see ToolEngine.cancel_all()).
         system_prompt:     this agent's own instructions, independent of the main
                            conversation's system prompt.
         endpoint:          agent-tools server endpoint - this agent's own tools live
@@ -59,6 +60,7 @@ class AgentBase(ToolBase):
                            same reasoning as the main engine's cap.
         timeout:           passed through to LLMEngine.
         """
+        super().__init__()
         self.client = client
         self.model = model
         self.endpoint = endpoint
@@ -70,10 +72,12 @@ class AgentBase(ToolBase):
 
     async def run(self, query: str) -> str:
         """Runs one full agent task to completion and returns the final assembled
-        answer - collects every sentence LLMEngine.ask() yields into one string, since
-        an agent isn't streaming to anything itself, it just returns one result to
-        whoever called it (one of this agent's own exposed tool methods)."""
+        answer - collects every sentence LLMEngine.output() yields into one string
+        (stopping at the first None, since this engine only ever gets one submit()),
+        since an agent isn't streaming to anything itself, it just returns one result
+        to whoever called it (one of this agent's own exposed tool methods)."""
         requester = ZMQRpcRequester(self.endpoint)
+        engine = None
         try:
             async with Client(McpTransport(requester)) as mcp_client:
                 tool_engine = ToolEngine(sources={"agent": mcp_client}, whitelists={"agent": self.whitelist})
@@ -88,6 +92,15 @@ class AgentBase(ToolBase):
                     client=self.client, model=self.model, memory=memory, tool_engine=tool_engine,
                     max_tokens=self.max_tokens, timeout=self.timeout,
                 )
-                return " ".join([s async for s in engine.ask(query)])
+                engine.submit(query)
+
+                parts = []
+                async for item in engine.output():
+                    if item is None:
+                        break
+                    parts.append(item)
+                return " ".join(parts)
         finally:
             requester.close()
+            if engine is not None:
+                engine.shutdown()

@@ -50,6 +50,13 @@ class RobotMemory:
     def add(self, message: dict) -> None:
         self.working.add(message)
 
+    def insert_resolved(self, anchor: dict, messages: list[dict]) -> None:
+        """Splices a previously-parked, now-resolved exchange (tool call + result +
+        synthesized answer) into working memory at anchor's chronological position -
+        see WorkingMemory.insert_after(). Facade only, so callers (LLMEngine) never
+        reach into working memory directly."""
+        self.working.insert_after(anchor, messages)
+
     def end_turn(self) -> None:
         self.working.end_turn()
 
@@ -84,10 +91,17 @@ class RobotMemory:
         return self._trim_to_budget(messages)
 
     def flush_all(self) -> None:
-        """Unconditionally push working's remaining content down through short_term, and
-        wait for any in-flight background summarization before returning - called on
-        shutdown so nothing is lost just because the session ended early."""
-        self.working.flush()
+        """On shutdown: archives whatever's left in working memory straight to
+        long_term, skipping short_term's summarization entirely - nobody will ever
+        read a fresh running summary again once the process exits, so computing one on
+        the way out is pure waste, and it's an LLM call that can itself fail or hang
+        right when we're trying to exit cleanly. Anything short_term was ALREADY
+        summarizing before this call is still waited on below (avoid abandoning a
+        thread mid-flight), just nothing new gets queued into it here."""
+        remaining = self.working.get()
+        if remaining and self.long_term is not None:
+            self.long_term.add(remaining)
+        self.working.flush(notify=False)
         if self.short_term is not None:
             self.short_term.flush()
         if self.long_term is not None:

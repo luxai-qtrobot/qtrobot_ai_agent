@@ -2,20 +2,56 @@
 llm_engine.py - LLMEngine: reusable glue between an OpenAI-compatible client, an
 optional RobotMemory, and an optional ToolEngine (MCP tool-calling).
 
-Owns the round-loop mechanics (stream -> check tool_calls -> execute via ToolEngine ->
-feed results back -> repeat until a round has no more tool_calls) and memory bookkeeping,
-so callers don't re-implement it per script. Does NOT decide what to do with the model's
-output (speak it, log it, etc.) - that's presentation logic and stays with the caller.
-ask() yields each complete sentence as it's produced, not per-round or per-token, so a
-caller wanting low-latency TTS can start speaking sentence 1 while the model is still
-generating sentence 2.
+submit()/output()/cancel() replace the old blocking ask(). A single background worker
+thread processes one submitted input at a time - no concurrent LLM calls, matching the
+earlier design agreement - but a round that comes back with tool_calls is never waited
+on: it's "parked" (dispatched non-blocking via ToolEngine.execute_async(), NOT added to
+memory yet) so the worker is immediately free to start the next submitted input rather
+than sit idle for a slow tool/agent call.
+
+When a parked round resolves, a dedicated follow-up completion - whose message array
+ends exactly at the tool result, the one shape models reliably know how to continue -
+produces the actual answer. That answer, together with the original tool call and its
+result, then gets spliced into WorkingMemory at its true chronological position (right
+after the question that triggered it, not appended wherever it happened to finish) via
+RobotMemory.insert_resolved(). Its sentences flow into the same output() stream as
+everything else - a caller doesn't need to know or care which submitted turn produced
+what, it just drains output() in the order things become ready.
+
+cancel() does two independent things: it stops sentences from being pushed to output()
+for whatever's currently streaming live, and it calls ToolEngine.cancel_all() to mark
+every currently in-flight tool call (across the live round AND any parked ones) as
+unwanted - see tool_engine.py for how that actually stops (or fails to stop) the
+underlying call. Either way, execute_async()'s callback comes back with the CANCELLED
+sentinel instead of real results for anything that was in flight at the time - see
+_resolve_parked(), which splices in a short fixed reply instead of running the normal
+follow-up completion, so the model doesn't see an unanswered question sitting in
+history and spontaneously retry it later.
+
+Known, deliberate simplification: a spliced-in exchange does not get the normal
+end_turn() tool-result compaction (that operates on the tail of memory, not an
+arbitrary earlier position) - it stays as full, uncompacted messages. Acceptable for
+now; revisit if it turns out to matter in practice.
 """
 
+import asyncio
+import queue
 import re
+import threading
 
 from luxai.magpie.utils import Logger
 
+from tool.tool_engine import CANCELLED
+
 SENTENCE_END_RE = re.compile(r"[.!?]+(\s+)")
+
+_SHUTDOWN = object()   # tells the worker thread to stop
+_STOP = object()       # tells output() to end the stream
+
+# Spliced into memory (never spoken) in place of a cancelled round's real answer - see
+# _resolve_parked(). Plain, first-person, short: matches the system prompt's own voice
+# in case it later surfaces in a short-term-memory summary.
+CANCELLED_REPLY = "I didn't finish that - it was cancelled."
 
 
 def extract_sentences(buffer: str):
@@ -34,12 +70,15 @@ class LLMEngine:
     def __init__(self, client, model: str, memory=None, tool_engine=None, system_prompt: str = None,
                  max_tokens: int = 800, timeout: float = 60.0):
         """
-        client:        a (sync) OpenAI client.
+        client:        a (sync) OpenAI client - safe to share across threads, this
+                       class calls it from more than one (documented httpx.Client
+                       thread-safety, same assumption ShortTermMemory relies on).
         model:         model name passed to every completion call.
         memory:        a RobotMemory instance, or None to fall back to a plain in-memory
                        history list (seeded with system_prompt, if given).
         tool_engine:   a ToolEngine instance for MCP tool-calling, or None for plain chat
-                       (no tools=, no tool-call handling).
+                       (no tools=, no tool-call handling, no parking - a round can never
+                       come back with tool_calls if none were ever offered).
         system_prompt: only used when memory is None, to seed the fallback history.
         max_tokens:    hard cap on generated tokens per round - guards against a runaway
                        generation (e.g. the model looping on a reasoning/think tag and
@@ -58,65 +97,208 @@ class LLMEngine:
         self.timeout = timeout
         self._history = [{"role": "system", "content": system_prompt}] if (memory is None and system_prompt) else []
 
-    async def ask(self, user_input: str):
-        """Run one full user turn - streaming, tool-calling, memory bookkeeping - and
-        yield each complete sentence as soon as it's produced. Nothing is returned; a
-        caller not using the generator's output gets nothing meaningful from calling
-        this without iterating it."""
-        self._add({"role": "user", "content": user_input})
+        self._input_queue = queue.Queue()
+        self._output_queue = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
 
-        round_num = 1
+    # ------------------------------------------------------------------
+    # Public - submit/output/cancel/shutdown
+    # ------------------------------------------------------------------
+
+    def submit(self, user_input: str) -> None:
+        """Non-blocking - queues user_input, processed once the worker is free (one
+        submitted input at a time; see class docstring for why a busy worker doesn't
+        mean a stalled conversation)."""
+        self._input_queue.put(user_input)
+
+    def cancel(self) -> None:
+        """Stops the turn currently streaming live from yielding any more output, and
+        asks ToolEngine to stop/discard every tool call currently in flight - see class
+        docstring."""
+        self._cancel_event.set()
+        if self.tool_engine:
+            self.tool_engine.cancel_all()
+
+    async def output(self):
+        """Async generator - yields each complete sentence as it becomes available,
+        from whichever submitted turn produced it, plus None once some turn fully
+        completes. A caller only interested in one submitted turn's answer (e.g.
+        AgentBase, which submits exactly one input per LLMEngine instance) can stop at
+        the first None; a caller draining forever (e.g. the main CLI loop, servicing
+        many submit() calls over this engine's lifetime) just skips None and keeps
+        going, until shutdown() ends the stream (see there for why a plain task.cancel()
+        from the caller's side can't stop this cleanly on its own)."""
         while True:
-            messages = self._get_messages()
-            gen = self._stream_round(messages, label=f"round {round_num}")
+            item = await asyncio.to_thread(self._output_queue.get)
+            if item is _STOP:
+                return
+            yield item
 
-            # Manually drive the sync generator (async generators can't use `yield
-            # from`) so we can both forward its yields and capture its final
-            # (assistant_message, tool_calls) via StopIteration.value.
-            assistant_msg, tool_calls = None, None
-            try:
-                while True:
-                    sentence = next(gen)
-                    yield sentence
-            except StopIteration as stop:
-                assistant_msg, tool_calls = stop.value
+    def shutdown(self) -> None:
+        """Stops the background worker thread, and unblocks output() so it returns
+        cleanly instead of hanging. Call when this engine is done being used (e.g.
+        AgentBase.run() calls this in its finally block, since it builds a fresh
+        LLMEngine per call and would otherwise leak one idle thread per call; the main
+        CLI loop calls this on /exit).
 
+        output() sits blocked inside `await asyncio.to_thread(queue.get)` - a plain
+        `task.cancel()` on whatever's draining output() only stops *waiting* for that
+        thread-pool call, it can't interrupt the blocking queue.get() already running
+        in the thread pool, so cancelling that task alone hangs forever once nothing
+        more is ever queued. Pushing a sentinel here instead lets output() notice and
+        return on its own, same trick shutdown already uses to stop the worker."""
+        self._input_queue.put(_SHUTDOWN)
+        self._worker.join(timeout=5.0)
+        self._output_queue.put(_STOP)
+
+    # ------------------------------------------------------------------
+    # Internal - worker thread: processes one submitted input at a time
+    # ------------------------------------------------------------------
+
+    def _worker_loop(self) -> None:
+        while True:
+            user_input = self._input_queue.get()
+            if user_input is _SHUTDOWN:
+                return
+            self._cancel_event.clear()
+            self._process_turn(user_input)
+
+    def _process_turn(self, user_input: str) -> None:
+        anchor = self._add({"role": "user", "content": user_input})
+        context = self._get_messages()
+        assistant_msg, tool_calls = self._run_round(context, respect_cancel=True, label="round 1")
+
+        if not tool_calls or not self.tool_engine:
             self._add(assistant_msg)
+            if self.memory:
+                self.memory.end_turn()
+            self._output_queue.put(None)  # turn complete
+            return
 
+        for tc in tool_calls:
+            Logger.debug(f"[tool call] {tc['name']}({tc['arguments']})")
+
+        # Park: this round is not committed to memory yet. context is a snapshot as of
+        # right now - it must NOT include anything a later, unrelated submit() adds
+        # while this one is still resolving, or the eventual synthesis call would see
+        # content it shouldn't (see class docstring / the design discussion this
+        # implements). Dispatching here returns immediately - the worker loop is free
+        # to pick up the next queued input without waiting on this tool call at all.
+        self.tool_engine.execute_async(
+            tool_calls,
+            lambda results: self._resolve_parked(anchor, context, assistant_msg, results),
+        )
+
+    def _resolve_parked(self, anchor: dict, context: list, pending_msg: dict, results: list) -> None:
+        """Runs on ToolEngine.execute_async()'s own background thread, never the main
+        worker thread - blocking here (a follow-up completion, another tool round) is
+        fine, there's nothing else for this thread to do, and it can't delay the next
+        submitted input either way.
+
+        results is CANCELLED when this round's tool call(s) were cancelled before they
+        finished (see cancel()/ToolEngine.cancel_all()) - splice in a fixed closing
+        reply instead of running the follow-up completion at all, so the anchor doesn't
+        sit in memory as a permanently unanswered question the model might pick back up
+        on its own later."""
+        if results is CANCELLED:
+            self._insert_resolved(anchor, [{"role": "assistant", "content": CANCELLED_REPLY}])
+            self._output_queue.put(None)
+            return
+
+        resolved = [pending_msg] + self._tool_result_messages(results)
+
+        while True:
+            full_context = context + resolved
+            assistant_msg, tool_calls = self._run_round(full_context, respect_cancel=False, label="parked round")
+            resolved.append(assistant_msg)
             if not tool_calls:
                 break
-
             for tc in tool_calls:
                 Logger.debug(f"[tool call] {tc['name']}({tc['arguments']})")
+            tool_results = self._execute_tools_blocking(tool_calls)
+            if tool_results is CANCELLED:
+                # This iteration's assistant_msg (just appended, with tool_calls) now
+                # has no matching tool results - replace it rather than leave it
+                # dangling, or the next real completion call would 400 on the orphaned
+                # tool_calls/tool_result pairing.
+                resolved[-1] = {"role": "assistant", "content": CANCELLED_REPLY}
+                break
+            resolved.extend(self._tool_result_messages(tool_results))
 
-            results = await self.tool_engine.execute(tool_calls)
-            for r in results:
-                Logger.debug(f"[tool result] {r['content']}")
-                self._add({
-                    "role": "tool",
-                    "tool_call_id": r["tool_call_id"],
-                    "content": r["content"],
-                })
-                for extra in r["extra_messages"]:
-                    self._add(extra)
+        self._insert_resolved(anchor, resolved)
+        self._output_queue.put(None)  # turn complete
 
-            round_num += 1
+    def _run_round(self, messages: list, respect_cancel: bool, label: str = ""):
+        """Drives _stream_round() to completion, pushing each sentence to output()
+        unless respect_cancel and a cancel() happened for the currently-live turn.
+        Returns (assistant_message, tool_calls)."""
+        gen = self._stream_round(messages, label=label)
+        try:
+            while True:
+                sentence = next(gen)
+                if not (respect_cancel and self._cancel_event.is_set()):
+                    self._output_queue.put(sentence)
+        except StopIteration as stop:
+            return stop.value
 
-        if self.memory:
-            self.memory.end_turn()
+    def _execute_tools_blocking(self, tool_calls: list[dict]) -> list[dict]:
+        """Blocking wrapper around ToolEngine.execute_async() - safe here because
+        _resolve_parked already runs off the main worker thread, so blocking this
+        thread doesn't freeze anything. Still goes through execute_async (not a bare
+        asyncio.run()) so dispatch lands on the correct event loop - see
+        ToolEngine.execute_async's own docstring for why that matters."""
+        done = threading.Event()
+        box = {}
+
+        def _on_done(results):
+            box["results"] = results
+            done.set()
+
+        self.tool_engine.execute_async(tool_calls, _on_done)
+        done.wait()
+        return box["results"]
+
+    def _tool_result_messages(self, results: list[dict]) -> list[dict]:
+        messages = []
+        for r in results:
+            Logger.debug(f"[tool result] {r['content']}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": r["tool_call_id"],
+                "content": r["content"],
+            })
+            messages.extend(r["extra_messages"])
+        return messages
 
     # ------------------------------------------------------------------
-    # Internal
+    # Internal - memory (handles both RobotMemory and the plain-history fallback)
     # ------------------------------------------------------------------
 
-    def _add(self, message: dict) -> None:
+    def _add(self, message: dict) -> dict:
+        """Returns the message object itself, so callers can hold onto it as an anchor
+        for a later insert_resolved()/insert_after() splice - matched by identity, not
+        position, since positions shift as other turns get added."""
         if self.memory:
             self.memory.add(message)
         else:
             self._history.append(message)
+        return message
+
+    def _insert_resolved(self, anchor: dict, messages: list[dict]) -> None:
+        if self.memory:
+            self.memory.insert_resolved(anchor, messages)
+            return
+        try:
+            index = next(i for i, m in enumerate(self._history) if m is anchor)
+        except StopIteration:
+            self._history.extend(messages)
+        else:
+            self._history[index + 1:index + 1] = messages
 
     def _get_messages(self) -> list:
-        return self.memory.get() if self.memory else self._history
+        return self.memory.get() if self.memory else list(self._history)
 
     def _stream_round(self, messages: list, label: str = ""):
         """Sync generator: yields each complete sentence as it streams in. Returns
@@ -142,6 +324,11 @@ class LLMEngine:
             Logger.debug(f"--- streaming deltas ({label}) ---")
             for chunk in stream:
                 delta = chunk.choices[0].delta
+
+                # reasoning_content isn't a declared field on ChoiceDelta (it's a
+                # llama.cpp/vLLM extension, not part of OpenAI's schema) - chunks that
+                # don't carry it (e.g. the first, role-only chunk) don't have the key
+                # at all, so a direct delta.reasoning_content raises AttributeError.
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning and Logger.log_level == "DEBUG":
                     print(reasoning, end="", flush=True)

@@ -23,6 +23,7 @@ class WebSearchTools(ToolBase):
     def __init__(self, api_key: str = None):
         """api_key: Tavily API key. Falls back to the TAVILY_API_KEY environment
         variable if not given - never hardcode a real key in source."""
+        super().__init__()
         api_key = api_key or os.environ.get("TAVILY_API_KEY")
         if not api_key:
             raise ValueError(

@@ -23,7 +23,8 @@ from .tool_base import ToolBase
 class UserTools(ToolBase):
 
     def __init__(self, robot):
-        self.robot = robot        
+        super().__init__()
+        self.robot = robot
         self._camera_reader = self.robot.camera.stream.open_color_reader()
 
 

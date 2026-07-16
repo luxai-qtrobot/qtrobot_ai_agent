@@ -13,7 +13,9 @@ from luxai.magpie.schema import McpSchema
 from agents.agent_base import AGENT_TOOLS_ENDPOINT, AgentBase
 
 INSTRUCTIONS_PATH = Path(__file__).parent / "instructions.txt"
-WEB_SEARCH_WHITELIST = {"search_web_api", "fetch_url"}
+# tool_name -> cancel_tool_name | None - see ToolEngine.cancel_all(). Neither of these
+# local tools has a cancel counterpart yet.
+WEB_SEARCH_WHITELIST = {"search_web_api": None, "fetch_url": None}
 
 
 class WebSearchAgent(AgentBase):

@@ -16,6 +16,7 @@ from .tool_base import ToolBase
 class MemoryTools(ToolBase):
 
     def __init__(self, long_term):
+        super().__init__()
         self.long_term = long_term
 
     def register(self, schema: McpSchema) -> None:
