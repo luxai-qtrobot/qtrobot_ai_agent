@@ -170,6 +170,14 @@ class LLMEngine:
         context = self._get_messages()
         assistant_msg, tool_calls = self._run_round(context, respect_cancel=True, label="round 1")
 
+        if assistant_msg is CANCELLED:
+            # _stream_round noticed cancel() mid-stream and cut the round short -
+            # splice the same fixed closing reply used for a cancelled tool call,
+            # rather than keep a truncated assistant_msg in memory (see _stream_round).
+            self._insert_resolved(anchor, [{"role": "assistant", "content": CANCELLED_REPLY}])
+            self._output_queue.put(None)
+            return
+
         if not tool_calls or not self.tool_engine:
             self._add(assistant_msg)
             if self.memory:
@@ -231,15 +239,14 @@ class LLMEngine:
         self._output_queue.put(None)  # turn complete
 
     def _run_round(self, messages: list, respect_cancel: bool, label: str = ""):
-        """Drives _stream_round() to completion, pushing each sentence to output()
-        unless respect_cancel and a cancel() happened for the currently-live turn.
-        Returns (assistant_message, tool_calls)."""
-        gen = self._stream_round(messages, label=label)
+        """Drives _stream_round() to completion, pushing each sentence to output() as
+        it arrives. Returns (assistant_message, tool_calls) - or (CANCELLED, []) if
+        respect_cancel and cancel() fired mid-stream, see _stream_round()."""
+        gen = self._stream_round(messages, respect_cancel=respect_cancel, label=label)
         try:
             while True:
                 sentence = next(gen)
-                if not (respect_cancel and self._cancel_event.is_set()):
-                    self._output_queue.put(sentence)
+                self._output_queue.put(sentence)
         except StopIteration as stop:
             return stop.value
 
@@ -300,11 +307,21 @@ class LLMEngine:
     def _get_messages(self) -> list:
         return self.memory.get() if self.memory else list(self._history)
 
-    def _stream_round(self, messages: list, label: str = ""):
+    def _stream_round(self, messages: list, respect_cancel: bool, label: str = ""):
         """Sync generator: yields each complete sentence as it streams in. Returns
         (assistant_message, tool_calls) via StopIteration.value once the round ends -
         tool_calls is the flat [{'id','name','arguments'}, ...] shape ToolEngine.execute()
-        expects; assistant_message is the OpenAI-format message ready for memory/history."""
+        expects; assistant_message is the OpenAI-format message ready for memory/history.
+
+        If respect_cancel and cancel() fires while still streaming, stops pulling
+        further chunks - checked once per raw chunk, not once per sentence, so it cuts
+        in within roughly one chunk's latency rather than waiting for the whole
+        response - and closes the underlying stream so the connection is actually
+        released (most OpenAI-compatible backends stop generating/billing once the
+        client disconnects; a `break` alone would just abandon the iterator without
+        closing anything). Returns (CANCELLED, []) instead of a real assistant_message
+        in that case - the caller replaces it with a fixed closing reply rather than
+        keep whatever content had streamed in so far."""
         buffer = ""
         content = ""
         tool_calls_acc = {}  # index -> {"id": str, "name": str, "arguments": str}
@@ -323,6 +340,14 @@ class LLMEngine:
 
             Logger.debug(f"--- streaming deltas ({label}) ---")
             for chunk in stream:
+                if respect_cancel and self._cancel_event.is_set():
+                    Logger.debug(f"--- cancelled mid-stream ({label}) ---")
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    return CANCELLED, []
+
                 delta = chunk.choices[0].delta
 
                 # reasoning_content isn't a declared field on ChoiceDelta (it's a
