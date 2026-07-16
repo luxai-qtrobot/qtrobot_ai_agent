@@ -139,9 +139,12 @@ class LLMEngine:
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
 
-            # Logger.debug(f"--- streaming deltas ({label}) ---")
+            Logger.debug(f"--- streaming deltas ({label}) ---")
             for chunk in stream:
                 delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning and Logger.log_level == "DEBUG":
+                    print(reasoning, end="", flush=True)
 
                 if delta.content:
                     content += delta.content
@@ -176,7 +179,7 @@ class LLMEngine:
         if leftover:
             yield leftover
 
-        # Logger.debug(f"--- end of stream ({label}); full content={content!r} ---")
+        Logger.debug(f"--- end of stream ({label}); full content={content!r} ---")
 
         if not tool_calls_acc:
             return {"role": "assistant", "content": content}, []
