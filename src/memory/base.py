@@ -50,3 +50,21 @@ class ShortTermMemoryBase(ABC):
 
     @abstractmethod
     def flush(self) -> None: ...
+
+
+class WorldStateMemoryBase(ABC):
+    """Contract for the world-state-memory role: transient, currently-true facts about
+    in-flight background activity and live environment/sensor state - never
+    accumulated, never summarized, rendered fresh from whatever's currently held."""
+
+    @abstractmethod
+    def add(self, key: str, text: str) -> None: ...
+
+    @abstractmethod
+    def remove(self, key: str) -> None: ...
+
+    @abstractmethod
+    def finish(self, updates: dict[str, str]) -> str: ...
+
+    @abstractmethod
+    def render(self) -> str: ...

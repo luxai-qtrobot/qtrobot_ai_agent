@@ -12,23 +12,29 @@ from .utils import count_message_tokens, count_messages_tokens
 
 class RobotMemory:
 
-    def __init__(self, static: str, max_tokens: int, working, short_term=None, long_term=None):
+    def __init__(self, static: str, max_tokens: int, working, short_term=None, long_term=None, world_state=None):
         """
-        static:     always-on content (e.g. system prompt) - never trimmed.
-        max_tokens: the one absolute token ceiling in the whole system. Enforced only at
-                    get() time, non-destructively - it decides what's included in a given
-                    call, it never deletes anything from working/short_term's own stores.
-        working:    a WorkingMemory instance (required).
-        short_term: a ShortTermMemory instance, or None to skip that tier.
-        long_term:  a LongTermMemory instance, or None to skip that tier - archived chat
-                    history and loaded documents both live there (see
-                    memory/long_term_memory.py).
+        static:      always-on content (e.g. system prompt) - never trimmed.
+        max_tokens:  the one absolute token ceiling in the whole system. Enforced only at
+                     get() time, non-destructively - it decides what's included in a given
+                     call, it never deletes anything from working/short_term's own stores.
+        working:     a WorkingMemory instance (required).
+        short_term:  a ShortTermMemory instance, or None to skip that tier.
+        long_term:   a LongTermMemory instance, or None to skip that tier - archived chat
+                     history and loaded documents both live there (see
+                     memory/long_term_memory.py).
+        world_state: a WorldStateMemory instance, or None to skip that tier - transient
+                     "what's happening right now" (in-flight tool/agent calls, live
+                     sensor state), rendered fresh at every get() (see
+                     memory/world_state_memory.py). LLMEngine drives it via
+                     add_world_state()/finish_world_state()/remove_world_state().
         """
         self.static = static
         self.max_tokens = max_tokens
         self.working = working
         self.short_term = short_term
         self.long_term = long_term
+        self.world_state = world_state
 
         self.working.bind(max_tokens, on_evict=self._on_working_evict)
         if self.short_term is not None:
@@ -60,6 +66,26 @@ class RobotMemory:
     def end_turn(self) -> None:
         self.working.end_turn()
 
+    def add_world_state(self, key: str, text: str) -> None:
+        """Marks a background action/environment fact as currently true - e.g. a
+        just-dispatched tool call. No-op if this RobotMemory has no world_state tier."""
+        if self.world_state is not None:
+            self.world_state.add(key, text)
+
+    def remove_world_state(self, key: str) -> None:
+        """Clears a world-state fact without narrating it as finished - used when a
+        batch is discarded (cancelled) rather than resolved. No-op without world_state."""
+        if self.world_state is not None:
+            self.world_state.remove(key)
+
+    def finish_world_state(self, updates: dict[str, str]) -> str:
+        """Marks each key in updates finished, captures one fresh render of the whole
+        current world state, and removes exactly those keys - see
+        WorldStateMemory.finish(). Returns "" without a world_state tier."""
+        if self.world_state is not None:
+            return self.world_state.finish(updates)
+        return ""
+
     def get(self) -> list[dict]:
         """Assemble static + working's raw messages + short_term summary into the final
         list ready to hand to client.chat.completions.create(messages=...)."""
@@ -87,6 +113,18 @@ class RobotMemory:
         summary = self.short_term.get() if self.short_term is not None else ""
         if summary:
             messages.append({"role": "user", "content": summary})
+
+        # Last of all: the freshest, most time-sensitive content gets the position
+        # closest to generation - same recency reasoning as the summary above, just
+        # one step further. A reserved slot, not a conditional append: WorldStateMemory
+        # always renders something (an explicit "nothing in progress" when it has no
+        # entries - see EMPTY_TEXT), never omitted, because an absent section is a far
+        # weaker signal than an explicit one against a strong, recent, first-person
+        # claim already sitting earlier in the transcript (e.g. "I am currently
+        # searching..."). Regenerated from scratch every call - never itself part of
+        # working memory's stored messages.
+        if self.world_state is not None:
+            messages.append({"role": "user", "content": self.world_state.render()})
 
         return self._trim_to_budget(messages)
 
@@ -160,9 +198,16 @@ class RobotMemory:
         lead_count = 2 if has_doc_index else 1
         lead_msgs = messages[:lead_count]
 
+        # Both the summary and world-state messages are appended, in that order, at
+        # the tail of get() - each is kept whole or dropped whole (never trimmed
+        # piecemeal), same as before; world_state is tried first (it's later = higher
+        # recency value) so it's the one that survives if budget is tight enough that
+        # both can't fit.
         has_summary = self.short_term is not None and self.short_term.get() != ""
-        summary_msg = messages[-1] if has_summary else None
-        working_msgs = messages[lead_count:-1] if has_summary else messages[lead_count:]
+        has_world_state = self.world_state is not None  # a reserved slot - always renders something
+        tail_count = (1 if has_summary else 0) + (1 if has_world_state else 0)
+        tail_msgs = messages[len(messages) - tail_count:] if tail_count else []
+        working_msgs = messages[lead_count:len(messages) - tail_count] if tail_count else messages[lead_count:]
 
         # The current, still-open turn is never trimmed - same protection WorkingMemory's
         # own eviction gives it, applied here too so the read path can't reintroduce the
@@ -173,12 +218,13 @@ class RobotMemory:
 
         budget = self.max_tokens - count_messages_tokens(lead_msgs) - count_messages_tokens(protected)
 
-        if summary_msg is not None:
-            summary_cost = count_message_tokens(summary_msg)
-            if summary_cost <= budget:
-                budget -= summary_cost
-            else:
-                summary_msg = None  # doesn't fit at all - drop it entirely
+        kept_tail = []
+        for msg in reversed(tail_msgs):
+            cost = count_message_tokens(msg)
+            if cost <= budget:
+                kept_tail.insert(0, msg)
+                budget -= cost
+            # else: doesn't fit at all - drop it entirely, keep checking the other one
 
         # Keep the most recent trimmable messages that fit, dropping the oldest first.
         # Stops at the first (oldest-going-backward) message that doesn't fit, rather
@@ -196,6 +242,5 @@ class RobotMemory:
         result = list(lead_msgs)
         result.extend(kept)
         result.extend(protected)
-        if summary_msg is not None:
-            result.append(summary_msg)
+        result.extend(kept_tail)
         return result

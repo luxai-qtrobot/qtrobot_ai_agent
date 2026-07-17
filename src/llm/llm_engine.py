@@ -2,9 +2,9 @@
 llm_engine.py - LLMEngine: reusable glue between an OpenAI-compatible client, an
 optional RobotMemory, and an optional ToolEngine (MCP tool-calling).
 
-submit()/output()/cancel() replace the old blocking ask(). A single background worker
-thread processes one submitted input at a time - no concurrent LLM calls, matching the
-earlier design agreement - but a round that comes back with tool_calls is never waited
+submit()/output()/cancel(): A single background worker
+thread processes one submitted input at a time - no concurrent LLM calls, 
+but a round that comes back with tool_calls is never waited
 on: it's "parked" (dispatched non-blocking via ToolEngine.execute_async(), NOT added to
 memory yet) so the worker is immediately free to start the next submitted input rather
 than sit idle for a slow tool/agent call.
@@ -48,10 +48,14 @@ SENTENCE_END_RE = re.compile(r"[.!?]+(\s+)")
 _SHUTDOWN = object()   # tells the worker thread to stop
 _STOP = object()       # tells output() to end the stream
 
-# Spliced into memory (never spoken) in place of a cancelled round's real answer - see
-# _resolve_parked(). Plain, first-person, short: matches the system prompt's own voice
-# in case it later surfaces in a short-term-memory summary.
+# Appended (never spoken) after whatever was actually said, when a round is cut short
+# - see _process_turn()/_resolve_parked(). Plain, first-person, short: matches the
+# system prompt's own voice in case it later surfaces in a short-term-memory summary.
+# Two variants: cancel() means the user/system abandoned the topic outright;
+# interrupt() (e.g. barge-in while speaking) doesn't - the topic may still matter,
+# so its note deliberately avoids implying the whole thing was rejected.
 CANCELLED_REPLY = "I didn't finish that - it was cancelled."
+INTERRUPTED_REPLY = "I was interrupted there."
 
 
 def extract_sentences(buffer: str):
@@ -100,6 +104,7 @@ class LLMEngine:
         self._input_queue = queue.Queue()
         self._output_queue = queue.Queue()
         self._cancel_event = threading.Event()
+        self._cancel_reason = "cancelled"  # which of cancel()/interrupt() set the event
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
@@ -114,12 +119,27 @@ class LLMEngine:
         self._input_queue.put(user_input)
 
     def cancel(self) -> None:
-        """Stops the turn currently streaming live from yielding any more output, and
-        asks ToolEngine to stop/discard every tool call currently in flight - see class
-        docstring."""
+        """The broad "stop everything" case (e.g. user says "cancel that"/"stop
+        stop"): stops the turn currently streaming live from yielding any more
+        output, and asks ToolEngine to stop/discard every tool call currently in
+        flight - see class docstring. Also clears WSM entries for those same ids
+        immediately, rather than waiting for _resolve_parked's eventual CANCELLED
+        handling - a call without a cancel pairing can keep running for a while after
+        this, and its "in progress" entry would otherwise stay visible (and
+        misleading) for that whole window even though the user already cancelled it."""
+        self._cancel_reason = "cancelled"
         self._cancel_event.set()
         if self.tool_engine:
-            self.tool_engine.cancel_all()
+            self._wsm_discard(self.tool_engine.cancel_all())
+
+    def interrupt(self) -> None:
+        """The narrow case (e.g. the user starts talking over TTS, detected by
+        ASR/VAD): stops the turn currently streaming live from yielding any more
+        output, same as cancel() - but does NOT touch in-flight tool/agent calls.
+        Starting to talk doesn't mean the user has abandoned whatever's running in
+        the background, just that they want to be heard now."""
+        self._cancel_reason = "interrupted"
+        self._cancel_event.set()
 
     async def output(self):
         """Async generator - yields each complete sentence as it becomes available,
@@ -170,11 +190,15 @@ class LLMEngine:
         context = self._get_messages()
         assistant_msg, tool_calls = self._run_round(context, respect_cancel=True, label="round 1")
 
-        if assistant_msg is CANCELLED:
-            # _stream_round noticed cancel() mid-stream and cut the round short -
-            # splice the same fixed closing reply used for a cancelled tool call,
-            # rather than keep a truncated assistant_msg in memory (see _stream_round).
-            self._insert_resolved(anchor, [{"role": "assistant", "content": CANCELLED_REPLY}])
+        if tool_calls is CANCELLED:
+            # _stream_round noticed cancel()/interrupt() mid-stream and cut the round
+            # short - assistant_msg (if not None) is exactly what was already spoken,
+            # kept as-is (see _stream_round) rather than discarded, plus a short
+            # closing note picked by which of cancel()/interrupt() triggered this.
+            reply = CANCELLED_REPLY if self._cancel_reason == "cancelled" else INTERRUPTED_REPLY
+            messages = ([assistant_msg] if assistant_msg is not None else [])
+            messages.append({"role": "assistant", "content": reply})
+            self._insert_resolved(anchor, messages)
             self._output_queue.put(None)
             return
 
@@ -188,6 +212,8 @@ class LLMEngine:
         for tc in tool_calls:
             Logger.debug(f"[tool call] {tc['name']}({tc['arguments']})")
 
+        self._wsm_add(tool_calls)
+
         # Park: this round is not committed to memory yet. context is a snapshot as of
         # right now - it must NOT include anything a later, unrelated submit() adds
         # while this one is still resolving, or the eventual synthesis call would see
@@ -196,10 +222,11 @@ class LLMEngine:
         # to pick up the next queued input without waiting on this tool call at all.
         self.tool_engine.execute_async(
             tool_calls,
-            lambda results: self._resolve_parked(anchor, context, assistant_msg, results),
+            lambda results: self._resolve_parked(anchor, context, assistant_msg, tool_calls, results),
         )
 
-    def _resolve_parked(self, anchor: dict, context: list, pending_msg: dict, results: list) -> None:
+    def _resolve_parked(self, anchor: dict, context: list, pending_msg: dict,
+                         dispatched_calls: list[dict], results: list) -> None:
         """Runs on ToolEngine.execute_async()'s own background thread, never the main
         worker thread - blocking here (a follow-up completion, another tool round) is
         fine, there's nothing else for this thread to do, and it can't delay the next
@@ -211,37 +238,84 @@ class LLMEngine:
         sit in memory as a permanently unanswered question the model might pick back up
         on its own later."""
         if results is CANCELLED:
+            self._wsm_discard(tc["id"] for tc in dispatched_calls)
             self._insert_resolved(anchor, [{"role": "assistant", "content": CANCELLED_REPLY}])
             self._output_queue.put(None)
             return
 
         resolved = [pending_msg] + self._tool_result_messages(results)
+        # World-state note for THIS batch, consumed exactly once by the completion
+        # call that's about to react to it - see _wsm_finish(). Re-set each time the
+        # loop dispatches a further batch below, so a later round doesn't keep
+        # re-showing an earlier round's now-stale "just finished" note.
+        wsm_msgs = self._wsm_finish(dispatched_calls)
 
         while True:
-            full_context = context + resolved
+            full_context = context + resolved + wsm_msgs
             assistant_msg, tool_calls = self._run_round(full_context, respect_cancel=False, label="parked round")
             resolved.append(assistant_msg)
             if not tool_calls:
                 break
             for tc in tool_calls:
                 Logger.debug(f"[tool call] {tc['name']}({tc['arguments']})")
+            self._wsm_add(tool_calls)
             tool_results = self._execute_tools_blocking(tool_calls)
             if tool_results is CANCELLED:
                 # This iteration's assistant_msg (just appended, with tool_calls) now
                 # has no matching tool results - replace it rather than leave it
                 # dangling, or the next real completion call would 400 on the orphaned
                 # tool_calls/tool_result pairing.
+                self._wsm_discard(tc["id"] for tc in tool_calls)
                 resolved[-1] = {"role": "assistant", "content": CANCELLED_REPLY}
                 break
+            wsm_msgs = self._wsm_finish(tool_calls)
             resolved.extend(self._tool_result_messages(tool_results))
 
         self._insert_resolved(anchor, resolved)
         self._output_queue.put(None)  # turn complete
 
+    # ------------------------------------------------------------------
+    # Internal - world state (in-flight background actions, see world_state_memory.py)
+    # ------------------------------------------------------------------
+
+    def _wsm_add(self, tool_calls: list[dict]) -> None:
+        """Marks each tool call as a running background action, visible in ANY
+        round's context (not just the one that dispatched it) via RobotMemory.get() -
+        this is what lets a concurrently-processed turn answer "what are you doing?"
+        correctly instead of appearing idle. No-op without a memory/world_state tier."""
+        if not self.memory:
+            return
+        for tc in tool_calls:
+            self.memory.add_world_state(tc["id"], f"[bg action]: {tc['name']}({tc['arguments']}) - in progress")
+
+    def _wsm_finish(self, tool_calls: list[dict]) -> list[dict]:
+        """Marks each tool call finished, captures one fresh render of the whole
+        current world state, and removes these entries immediately - before the
+        completion call that will use it even runs, not after (see WorldStateMemory.
+        finish()). Returns [] (nothing to append) if there was nothing to show, else a
+        single message to append to that one call's context."""
+        if not self.memory:
+            return []
+        updates = {tc["id"]: f"[bg action]: {tc['name']}({tc['arguments']}) - just finished" for tc in tool_calls}
+        text = self.memory.finish_world_state(updates)
+        return [{"role": "user", "content": text}] if text else []
+
+    def _wsm_discard(self, tool_call_ids) -> None:
+        """Clears world-state entries by id, without a "finished" narration - used
+        both when a batch was cancelled rather than resolved (CANCELLED_REPLY already
+        covers what the user sees there) and directly from cancel(), which only has
+        raw ids back from ToolEngine.cancel_all(), not tool_call dicts. Either way,
+        this just stops an entry lingering as "in progress" once it no longer is."""
+        if not self.memory:
+            return
+        for tool_call_id in tool_call_ids:
+            self.memory.remove_world_state(tool_call_id)
+
     def _run_round(self, messages: list, respect_cancel: bool, label: str = ""):
         """Drives _stream_round() to completion, pushing each sentence to output() as
-        it arrives. Returns (assistant_message, tool_calls) - or (CANCELLED, []) if
-        respect_cancel and cancel() fired mid-stream, see _stream_round()."""
+        it arrives. Returns (assistant_message, tool_calls) - or
+        (spoken_message_or_None, CANCELLED) if respect_cancel and cancel()/interrupt()
+        fired mid-stream, see _stream_round()."""
         gen = self._stream_round(messages, respect_cancel=respect_cancel, label=label)
         try:
             while True:
@@ -313,17 +387,21 @@ class LLMEngine:
         tool_calls is the flat [{'id','name','arguments'}, ...] shape ToolEngine.execute()
         expects; assistant_message is the OpenAI-format message ready for memory/history.
 
-        If respect_cancel and cancel() fires while still streaming, stops pulling
-        further chunks - checked once per raw chunk, not once per sentence, so it cuts
-        in within roughly one chunk's latency rather than waiting for the whole
-        response - and closes the underlying stream so the connection is actually
-        released (most OpenAI-compatible backends stop generating/billing once the
-        client disconnects; a `break` alone would just abandon the iterator without
-        closing anything). Returns (CANCELLED, []) instead of a real assistant_message
-        in that case - the caller replaces it with a fixed closing reply rather than
-        keep whatever content had streamed in so far."""
+        If respect_cancel and cancel()/interrupt() fires while still streaming, stops
+        pulling further chunks - checked once per raw chunk, not once per sentence, so
+        it cuts in within roughly one chunk's latency rather than waiting for the
+        whole response - and closes the underlying stream so the connection is
+        actually released (most OpenAI-compatible backends stop generating/billing
+        once the client disconnects; a `break` alone would just abandon the iterator
+        without closing anything). Returns (spoken_message_or_None, CANCELLED) in that
+        case - spoken_message is exactly what was already yielded as complete
+        sentences (and so already sent to output()/spoken), None if nothing had been
+        spoken yet; any incomplete trailing fragment still sitting in the buffer was
+        never actually said, so it's dropped. The caller appends a short closing note
+        rather than discarding this real, already-spoken content."""
         buffer = ""
         content = ""
+        spoken = ""
         tool_calls_acc = {}  # index -> {"id": str, "name": str, "arguments": str}
 
         try:
@@ -341,12 +419,14 @@ class LLMEngine:
             Logger.debug(f"--- streaming deltas ({label}) ---")
             for chunk in stream:
                 if respect_cancel and self._cancel_event.is_set():
-                    Logger.debug(f"--- cancelled mid-stream ({label}) ---")
+                    Logger.debug(f"--- {self._cancel_reason} mid-stream ({label}) ---")
                     try:
                         stream.close()
                     except Exception:
                         pass
-                    return CANCELLED, []
+                    partial = spoken.strip()
+                    spoken_msg = {"role": "assistant", "content": partial} if partial else None
+                    return spoken_msg, CANCELLED
 
                 delta = chunk.choices[0].delta
 
@@ -364,6 +444,7 @@ class LLMEngine:
                     sentences, buffer = extract_sentences(buffer)
                     for sentence in sentences:
                         if sentence:
+                            spoken += sentence + " "
                             yield sentence
 
                 if delta.tool_calls:

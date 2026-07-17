@@ -155,7 +155,7 @@ class ToolEngine:
 
         future.add_done_callback(_finish)
 
-    def cancel_all(self) -> None:
+    def cancel_all(self) -> set[str]:
         """Marks every currently in-flight tool call cancelled - execute_async() will
         discard its result (see CANCELLED) once it finishes, regardless of whether it
         could actually be stopped early. For calls whose tool has a paired cancel tool
@@ -163,7 +163,13 @@ class ToolEngine:
         request to stop early - fire-and-forget, its own result is irrelevant here.
         Calls without a pairing just keep running to completion in the background;
         wasted computation, but no different from letting any other unwanted work
-        finish - never force-killed."""
+        finish - never force-killed.
+
+        Returns the tool_call_ids just marked cancelled. ToolEngine has no idea
+        anything else (e.g. a WSM "in progress" entry) is tracking these same ids -
+        it just hands them back so a caller like LLMEngine can clean up its own
+        bookkeeping immediately, rather than waiting for the (possibly still-running)
+        call to actually finish."""
         with self._pending_lock:
             pending = dict(self._pending)
             self._cancelled_ids.update(pending)
@@ -172,6 +178,8 @@ class ToolEngine:
             client, _, cancel_name = self._tools.get(tool_name, (None, None, None))
             if client is not None and cancel_name is not None:
                 asyncio.run_coroutine_threadsafe(self._dispatch_cancel(client, cancel_name), self._loop)
+
+        return set(pending)
 
     async def _dispatch_cancel(self, client: Client, cancel_name: str) -> None:
         try:

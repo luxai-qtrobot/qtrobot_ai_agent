@@ -36,6 +36,7 @@ from memory.long_term_memory import LongTermMemory
 from memory.robot_memory import RobotMemory
 from memory.short_term_memory import ShortTermMemory
 from memory.working_memory import WorkingMemory
+from memory.world_state_memory import WorldStateMemory
 from agents.agent_registry import AgentRegistry
 
 ROBOT_IP = "192.168.3.111"
@@ -97,6 +98,14 @@ SYSTEM_PROMPT = (
     "in that context. Use search_documents only when the answer may be in a loaded "
     "document. If no documents are loaded, do not call search_documents. "
 
+    "A message starting with '[World state ...]' near the end of the conversation is "
+    "not something the user said - it is your own live situational awareness: "
+    "background actions you are currently running ('[bg action]') and things "
+    "currently true about your environment ('[state]'). Use it to answer questions "
+    "about what you are doing or what is around you, and to avoid contradicting "
+    "yourself about an action that already finished or was stopped. If it is absent, "
+    "nothing notable is currently happening in the background. "
+
     "Never mention tools, APIs, prompts, hidden context, or internal implementation "
     "unless the user explicitly asks. Respond as QTrobot, not as an AI assistant."
 )
@@ -138,6 +147,7 @@ async def main():
         working=WorkingMemory(size_ratio=0.75, flush_ratio=0.2),
         short_term=ShortTermMemory(llm=client, model=LLM_MODEL, size_ratio=0.25, flush_ratio=0.2),
         long_term=long_term,
+        world_state=WorldStateMemory(),
     )
 
     # enable agents 
@@ -153,9 +163,6 @@ async def main():
 
     try:
         async with (
-            # 120s, not the 30s default - the "local" source includes agent-as-tool
-            # calls (e.g. search_web), which run a whole nested multi-round LLM
-            # conversation and can legitimately take longer than a plain tool call.
             Client(McpTransport(local_requester, timeout=120.0)) as local_client,
             Client(McpTransport(robot_requester)) as robot_client,
         ):
@@ -209,11 +216,6 @@ async def main():
             try:
                 await read_input_loop()
             finally:
-                # shutdown() (not output_task.cancel()) is what actually ends
-                # output_loop cleanly - see LLMEngine.shutdown()'s docstring for why a
-                # bare task.cancel() can't unblock a queue.get() already running in a
-                # thread-pool thread. Once shutdown() pushes its stop sentinel,
-                # output_task finishes on its own.
                 llm_engine.shutdown()
                 await output_task
     finally:
@@ -227,5 +229,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    Logger.set_level("DEBUG")
+    # Logger.set_level("DEBUG")
     asyncio.run(main())
