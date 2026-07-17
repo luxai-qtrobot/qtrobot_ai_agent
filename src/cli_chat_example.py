@@ -150,7 +150,7 @@ async def main():
         world_state=WorldStateMemory(),
     )
 
-    # enable agents 
+    # enable agents
     agents = AgentRegistry(client, LLM_MODEL)
 
     local_tool_server = LocalToolServer([

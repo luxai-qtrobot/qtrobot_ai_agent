@@ -30,6 +30,24 @@ from luxai.magpie.utils import Logger
 # tool_call_id in that batch was cancelled before it finished - see cancel_all().
 CANCELLED = object()
 
+# A tool ToolEngine offers itself - not sourced from any MCP client, not routed
+# through self._tools at all (see _run_one()). Lets the LLM translate a
+# natural-language "stop/cancel everything" request into cancel_all() directly, with
+# no round-trip and no separate provider/wiring needed anywhere else.
+CANCEL_ALL_TOOL_NAME = "cancel_all_actions"
+_CANCEL_ALL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": CANCEL_ALL_TOOL_NAME,
+        "description": (
+            "Stop everything currently in progress - any ongoing search, tool call, "
+            "or background action. Call this when the user asks you to cancel, stop, "
+            "or nevermind whatever you're currently doing."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 
 class ToolEngine:
 
@@ -69,6 +87,11 @@ class ToolEngine:
                 mcp_tools = [t for t in mcp_tools if t.name in whitelist]
 
             for tool in mcp_tools:
+                if tool.name == CANCEL_ALL_TOOL_NAME:
+                    raise ValueError(
+                        f"Tool name collision: '{tool.name}' is reserved by ToolEngine "
+                        f"itself, but '{source_name}' also defines it"
+                    )
                 if tool.name in tools:
                     other_source = tools[tool.name][1]
                     raise ValueError(
@@ -85,6 +108,11 @@ class ToolEngine:
                         "parameters": tool.inputSchema or {"type": "object", "properties": {}},
                     },
                 })
+
+        # ToolEngine's own built-in tool - not from any source, always offered (see
+        # CANCEL_ALL_TOOL_NAME above). Not added to `tools`: _run_one() special-cases
+        # it before ever consulting self._tools.
+        schemas.append(_CANCEL_ALL_SCHEMA)
 
         self._tools = tools
         self._schemas = schemas
@@ -190,6 +218,18 @@ class ToolEngine:
     async def _run_one(self, tc: dict) -> dict:
         tool_call_id = tc["id"]
         name = tc["name"]
+
+        if name == CANCEL_ALL_TOOL_NAME:
+            # Handled entirely in-process, no MCP call. Exclude this call's own id
+            # from _pending BEFORE calling cancel_all(), or it would mark itself
+            # cancelled too - execute_async()'s callback would then discard this very
+            # confirmation as CANCELLED, even though it's the one thing that must NOT
+            # be discarded.
+            with self._pending_lock:
+                self._pending.pop(tool_call_id, None)
+            self.cancel_all()
+            return {"tool_call_id": tool_call_id, "content": "Cancelled everything currently in progress.",
+                    "extra_messages": []}
 
         if name not in self._tools:
             return self._error_result(tool_call_id, f"tool '{name}' does not exist")

@@ -36,28 +36,33 @@ from memory.long_term_memory import LongTermMemory
 from memory.robot_memory import RobotMemory
 from memory.short_term_memory import ShortTermMemory
 from memory.working_memory import WorkingMemory
+from memory.world_state_memory import WorldStateMemory
 from agents.agent_registry import AgentRegistry
 
 ROBOT_IP = "192.168.3.111"
 ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
 
+# tool_name -> cancel_tool_name | None - see ToolEngine.cancel_all(). Left None for
+# now (fill in the robot's real cancel-service tool names, e.g. gesture_file_play ->
+# gesture_file_cancel, when this connection is actually re-enabled).
 ROBOT_TOOL_WHITELIST = {
-    "tts_engine_languages_get",
-    "tts_engines_list",
-    "face_emotion_list",
-    "face_emotion_show",
-    "face_emotion_stop",
-    "gesture_cancel",
-    "gesture_file_list",
-    "gesture_file_play",
-    "motor_move_home_all",
-    "speaker_volume_get",
-    "speaker_volume_set",
+    "tts_engine_languages_get": None,
+    "tts_engines_list": None,
+    "face_emotion_list": None,
+    "face_emotion_show": None,
+    "face_emotion_stop": None,
+    "gesture_cancel": None,
+    "gesture_file_list": None,
+    "gesture_file_play": None,
+    "motor_move_home_all": None,
+    "speaker_volume_get": None,
+    "speaker_volume_set": None,
 }
 
 LLM_API_BASE = "http://192.168.3.111:8080/v1"
+#LLM_API_BASE = "https://api.anthropic.com/v1/"
 LLM_MODEL = "gemma-4-12B-it-Q8_0.gguf"
-
+# LLM_MODEL = "claude-sonnet-4-6"
 MEMORY_MAX_TOKENS = 31000  # 31k
 
 DOCUMENTS_DIR = Path(__file__).resolve().parent.parent / "documents"
@@ -93,6 +98,14 @@ SYSTEM_PROMPT = (
     "in that context. Use search_documents only when the answer may be in a loaded "
     "document. If no documents are loaded, do not call search_documents. "
 
+    "A message starting with '[World state ...]' near the end of the conversation is "
+    "not something the user said - it is your own live situational awareness: "
+    "background actions you are currently running ('[bg action]') and things "
+    "currently true about your environment ('[state]'). Use it to answer questions "
+    "about what you are doing or what is around you, and to avoid contradicting "
+    "yourself about an action that already finished or was stopped. If it is absent, "
+    "nothing notable is currently happening in the background. "
+
     "Never mention tools, APIs, prompts, hidden context, or internal implementation "
     "unless the user explicitly asks. Respond as QTrobot, not as an AI assistant."
 )
@@ -119,6 +132,7 @@ async def main():
     # Single llm api client
     client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
 
+
     # Robot memmory
     long_term = LongTermMemory()
     long_term.load(LTM_CHAT_HISTORY_PATH)
@@ -133,9 +147,10 @@ async def main():
         working=WorkingMemory(size_ratio=0.75, flush_ratio=0.2),
         short_term=ShortTermMemory(llm=client, model=LLM_MODEL, size_ratio=0.25, flush_ratio=0.2),
         long_term=long_term,
+        world_state=WorldStateMemory(),
     )
 
-    # enable agents 
+    # enable agents
     agents = AgentRegistry(client, LLM_MODEL)
 
     local_tool_server = LocalToolServer([
@@ -148,9 +163,6 @@ async def main():
 
     try:
         async with (
-            # 120s, not the 30s default - the "local" source includes agent-as-tool
-            # calls (e.g. search_web), which run a whole nested multi-round LLM
-            # conversation and can legitimately take longer than a plain tool call.
             Client(McpTransport(local_requester, timeout=120.0)) as local_client,
             Client(McpTransport(robot_requester)) as robot_client,
         ):
@@ -158,32 +170,54 @@ async def main():
                 sources={"local": local_client, "robot": robot_client},
                 whitelists={"robot": ROBOT_TOOL_WHITELIST},
             )
+
             await tool_engine.discover()
             # tool_engine.print_schemas(raw=False)
 
             llm_engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
 
-            Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what do you see?', "                        
-                        "'/mem' shows memory ('/mem raw' for raw json memory), '/exit' close the chat.")
-            while True:
-                user_input = input("You: ").strip()
-                if not user_input:
-                    continue
-                if user_input == "/exit":
-                    break
-                if user_input == "/mem":
-                    memory.print()
-                    continue
-                if user_input == "/mem raw":
-                    memory.print(raw=True)
-                    continue
+            async def read_input_loop():
+                """Runs input() on a worker thread (via asyncio.to_thread) so it never
+                blocks output_loop below - submit()/cancel() are both non-blocking, so
+                typing a new line while a previous one is still resolving just works,
+                no special-casing needed here."""
+                while True:
+                    user_input = (await asyncio.to_thread(input, "You: ")).strip()
+                    if not user_input:
+                        continue
+                    if user_input == "/exit":
+                        return
+                    if user_input == "/cancel":
+                        llm_engine.cancel()
+                        Logger.info("Cancelled current response.")
+                        continue
+                    if user_input == "/mem":
+                        memory.print()
+                        continue
+                    if user_input == "/mem raw":
+                        memory.print(raw=True)
+                        continue
+                    llm_engine.submit(user_input)
 
-                async for text in llm_engine.ask(user_input):
-                    Logger.info(f"[SPEAK] {text}")
-                    handle = robot.tts.say_text_async(text, voice="Rosie")
-                    handle.wait()
-                    Logger.info(f"[SPEAK] DONE!")
+            async def output_loop():
+                """Drains output() forever - sentences arrive from whichever submitted
+                turn produced them, in the order they become ready; None (a completed
+                turn) is just skipped, this loop never stops on its own."""
+                async for item in llm_engine.output():
+                    if item is not None:
+                        Logger.info(f"[SPEAK] {item}")
+                        # handle = robot.tts.say_text_async(item, voice="Rosie")
 
+            Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what do you see?', "
+                        "'/mem' shows memory ('/mem raw' for raw json memory), '/cancel' cancels "
+                        "the current response, '/exit' close the chat.")
+
+            output_task = asyncio.create_task(output_loop())
+            try:
+                await read_input_loop()
+            finally:
+                llm_engine.shutdown()
+                await output_task
     finally:
         local_requester.close()
         robot_requester.close()
@@ -195,5 +229,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    Logger.set_level("DEBUG")
+    # Logger.set_level("DEBUG")
     asyncio.run(main())
