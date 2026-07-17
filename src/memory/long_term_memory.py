@@ -55,6 +55,14 @@ class _Record:
 
 class LongTermMemory:
 
+    USAGE_NOTE = (
+        "You automatically have access to the recent conversation and a summary of "
+        "older conversation. Use search_memory only when the needed information is "
+        "not already in that context. Use search_documents only when the answer may "
+        "be in a loaded document. If no documents are loaded, do not call "
+        "search_documents."
+    )
+
     def __init__(self, model_name: str = DEFAULT_MODEL, rerank_model: str = DEFAULT_RERANK_MODEL,
                  chunk_chars: int = 1000, chunk_overlap: int = 100):
         """

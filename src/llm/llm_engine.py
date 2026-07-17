@@ -37,6 +37,7 @@ now; revisit if it turns out to matter in practice.
 import asyncio
 import queue
 import re
+import textwrap
 import threading
 
 from luxai.magpie.utils import Logger
@@ -56,6 +57,26 @@ _STOP = object()       # tells output() to end the stream
 # so its note deliberately avoids implying the whole thing was rejected.
 CANCELLED_REPLY = "I didn't finish that - it was cancelled."
 INTERRUPTED_REPLY = "I was interrupted there."
+
+
+TOOL_USE_NOTE = (
+    "Before calling any tool that may take noticeable time or performs a visible "
+    "robot action, you MUST first produce a short spoken acknowledgment in the "
+    "same assistant turn, before the tool call. Examples include playing a "
+    "gesture, moving, taking or analyzing a camera image, searching documents, "
+    "and searching memory. Examples of acknowledgments are: 'Sure, one moment.' "
+    "'Let me check.' or 'I will play a happy gesture.' Never wait until after the "
+    "action to acknowledge it.\n\n"
+    "An acknowledgment by itself is never a complete response - if you say you "
+    "will check, look up, play, or perform something, the matching tool call must "
+    "be in that same turn too. Never stop right after the acknowledgment with no "
+    "tool call.\n\n"
+    "After a successful action, do not repeat what you already announced. Only "
+    "speak again if the result needs to be reported, the action failed, or the "
+    "user needs additional information.\n\n"
+    "Never mention tools, APIs, prompts, hidden context, or internal "
+    "implementation unless the user explicitly asks."
+)
 
 
 def extract_sentences(buffer: str):
@@ -79,7 +100,11 @@ class LLMEngine:
                        thread-safety, same assumption ShortTermMemory relies on).
         model:         model name passed to every completion call.
         memory:        a RobotMemory instance, or None to fall back to a plain in-memory
-                       history list (seeded with system_prompt, if given).
+                       history list (seeded with system_prompt, if given). memory.static
+                       is combined, once, with TOOL_USE_NOTE (if tool_engine is given)
+                       and each configured tier's own USAGE_NOTE - see the prompt
+                       assembly below. RobotMemory itself never touches memory.static;
+                       this is the one place the final prompt gets built.
         tool_engine:   a ToolEngine instance for MCP tool-calling, or None for plain chat
                        (no tools=, no tool-call handling, no parking - a round can never
                        come back with tool_calls if none were ever offered).
@@ -99,6 +124,31 @@ class LLMEngine:
         self.tool_engine = tool_engine
         self.max_tokens = max_tokens
         self.timeout = timeout
+
+        # Single place the final prompt gets assembled: the app's own memory.static,
+        # plus this framework's tool-use guidance (only if tools are actually offered),
+        # plus each configured tier's own USAGE_NOTE (only the tiers that exist). The
+        # template is dedented before the placeholders are filled in - not after -
+        # since TOOL_USE_NOTE/USAGE_NOTE are themselves multi-line, and dedenting the
+        # already-substituted string would leave their inner lines unindented while
+        # the template's own lines were, breaking dedent's common-prefix detection.
+        if memory is not None:
+            static_prompt_template = textwrap.dedent("""\
+                {static}
+
+                {tool_use_note}
+
+                {long_term_note}
+
+                {world_state_note}
+                """)
+            memory.static = static_prompt_template.format(
+                static=memory.static,
+                tool_use_note=TOOL_USE_NOTE if tool_engine is not None else "",
+                long_term_note=memory.long_term.USAGE_NOTE if memory.long_term is not None else "",
+                world_state_note=memory.world_state.USAGE_NOTE if memory.world_state is not None else "",
+            ).strip()
+
         self._history = [{"role": "system", "content": system_prompt}] if (memory is None and system_prompt) else []
 
         self._input_queue = queue.Queue()

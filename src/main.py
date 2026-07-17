@@ -1,18 +1,12 @@
 """
-tool_call_simple_memory.py - Same tool-calling chat loop as tool_call_simple.py, but
-using RobotMemory (working + short-term + long-term tiers) and LLMEngine instead of a
-plain history list and inline round-loop, to exercise the memory system + reusable
-engine end-to-end. search_memory/search_documents (tool/memory_tools.py) are both
-backed by the same LongTermMemory instance - see the system prompt below for how the
-model is guided to use them.
-
-No ASR/TTS - terminal in, terminal out. "[SPEAK] ..." stands in for TTS.
+main.py - QTrobot AI agent, real ASR/TTS: ASR (Parakeet, robot SDK) -> LLMEngine
+(memory + tool-calling) -> TTS (robot SDK), with barge-in support.
 
 Requirements:
     pip install openai luxai-magpie[mcp,video] tiktoken fastembed
 
 Usage (from this file's directory):
-    python tool_call_simple_memory.py
+    python main.py
 """
 
 import asyncio
@@ -41,6 +35,8 @@ from agents.agent_registry import AgentRegistry
 
 ROBOT_IP = "192.168.3.111"
 ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
+PARAKEET_ENDPOINT = f"tcp://{ROBOT_IP}:50860"
+REALSENSE_ENDPOINT = f"tcp://{ROBOT_IP}:50750"
 
 # tool_name -> cancel_tool_name | None - see ToolEngine.cancel_all(). Left None for
 # now (fill in the robot's real cancel-service tool names, e.g. gesture_file_play ->
@@ -73,43 +69,11 @@ SYSTEM_PROMPT = (
     "assistant controlling it. Use the available tools to perceive the environment, "
     "perform robot actions, search memory, and search user documents. Use tools when "
     "they improve accuracy or are needed to perform the user's request. Otherwise, "
-    "reply in plain text. "
+    "reply in plain text. Respond as QTrobot, not as an AI assistant. "
 
     "Keep every spoken response short and natural. Prefer one brief sentence. Avoid "
-    "long sentences, explanations, lists, emojis, repetition, and unnecessary details. "
-
-    "Before calling any tool that may take noticeable time or performs a visible robot "
-    "action, you MUST first produce a short spoken acknowledgment in the same assistant "
-    "turn, before the tool call. Examples include playing a gesture, moving, taking or "
-    "analyzing a camera image, searching documents, and searching memory. Examples of "
-    "acknowledgments are: 'Sure, one moment.' 'Let me check.' or 'I will play a happy "
-    "gesture.' Never wait until after the action to acknowledge it. "
-
-    "An acknowledgment by itself is never a complete response - if you say you will "
-    "check, look up, play, or perform something, the matching tool call must be in "
-    "that same turn too. Never stop right after the acknowledgment with no tool call. "
-
-    "After a successful action, do not repeat what you already announced. Only speak "
-    "again if the result needs to be reported, the action failed, or the user needs "
-    "additional information. "
-
-    "You automatically have access to the recent conversation and a summary of older "
-    "conversation. Use search_memory only when the needed information is not already "
-    "in that context. Use search_documents only when the answer may be in a loaded "
-    "document. If no documents are loaded, do not call search_documents. "
-
-    "A message starting with '[World state ...]' near the end of the conversation is "
-    "not something the user said - it is your own live situational awareness: "
-    "background actions you are currently running ('[bg action]') and things "
-    "currently true about your environment ('[state]'). Use it to answer questions "
-    "about what you are doing or what is around you, and to avoid contradicting "
-    "yourself about an action that already finished or was stopped. If it is absent, "
-    "nothing notable is currently happening in the background. "
-
-    "Never mention tools, APIs, prompts, hidden context, or internal implementation "
-    "unless the user explicitly asks. Respond as QTrobot, not as an AI assistant."
+    "long sentences, explanations, lists, emojis, repetition, and unnecessary details."
 )
-
 
 
 DOCUMENTS_SUMMARY = (
@@ -119,115 +83,199 @@ DOCUMENTS_SUMMARY = (
 )
 
 
-async def main():
-    robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
-    Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
-    robot.enable_plugin_zmq("realsense-driver", endpoint=f"tcp://{ROBOT_IP}:50750")
-    
-    # setup 
-    robot.speaker.set_volume(0.7)
-    robot.motor.home_all()
+class QTrobotAIAgent:
+    """Owns the entire agent: robot connection, memory tiers, tool discovery, agents,
+    the LLM engine, and the ASR/TTS conversation loop - one class, everything self-
+    contained, nothing left for a caller to wire up or tear down itself.
 
+    Lifecycle is explicit, not a context manager - construct, setup() (connects
+    everything), run() (the conversation loop), cleanup() (tears everything down,
+    reverse order of setup()) - construct/setup/run/cleanup, the same shape as a
+    typical robot demo node."""
 
-    # Single llm api client
-    client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
+    def __init__(self):
+        # Populated by setup() - nothing is connected/built until then.
+        self.robot = None
+        self.client = None
+        self.long_term = None
+        self.memory = None
+        self.agents = None
+        self.local_tool_server = None
+        self.tool_engine = None
+        self.llm_engine = None
+        self._local_requester = None
+        self._robot_requester = None
+        self._local_client = None
+        self._robot_client = None
+        self._speaking_handle = None
 
+    # ------------------------------------------------------------------
+    # Lifecycle: setup / run / cleanup
+    # ------------------------------------------------------------------
 
-    # Robot memmory
-    long_term = LongTermMemory()
-    long_term.load(LTM_CHAT_HISTORY_PATH)
+    async def setup(self) -> None:
+        """Connects the robot, builds memory/tools/agents, starts the LLM engine and
+        ASR listening. Call once before run()."""
+        self.robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
+        Logger.info(f"Connected to {self.robot.robot_id} ({self.robot.robot_type}), "
+                    f"SDK version: {self.robot.sdk_version}")
+        self.robot.enable_plugin_zmq("realsense-driver", endpoint=REALSENSE_ENDPOINT)
+        self.robot.speaker.set_volume(0.7)
+        self.robot.motor.home_all()
 
-    for doc in DirectoryReader.read(DOCUMENTS_DIR, summary=DOCUMENTS_SUMMARY):
-        long_term.add_document(text=doc.text, summary=doc.summary, meta=doc.meta)
-        Logger.info(f"Loaded document into long-term memory: {doc.meta['source']}")
-        
-    memory = RobotMemory(
-        static=SYSTEM_PROMPT,
-        max_tokens=MEMORY_MAX_TOKENS,
-        working=WorkingMemory(size_ratio=0.75, flush_ratio=0.2),
-        short_term=ShortTermMemory(llm=client, model=LLM_MODEL, size_ratio=0.25, flush_ratio=0.2),
-        long_term=long_term,
-        world_state=WorldStateMemory(),
-    )
+        self.client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
 
-    # enable agents
-    agents = AgentRegistry(client, LLM_MODEL)
+        self.long_term = LongTermMemory()
+        self.long_term.load(LTM_CHAT_HISTORY_PATH)
+        for doc in DirectoryReader.read(DOCUMENTS_DIR, summary=DOCUMENTS_SUMMARY):
+            self.long_term.add_document(text=doc.text, summary=doc.summary, meta=doc.meta)
+            Logger.info(f"Loaded document into long-term memory: {doc.meta['source']}")
 
-    local_tool_server = LocalToolServer([
-        UserTools(robot),
-        MemoryTools(long_term),
-        *agents.as_tools(),
+        self.memory = RobotMemory(
+            static=SYSTEM_PROMPT,
+            max_tokens=MEMORY_MAX_TOKENS,
+            working=WorkingMemory(size_ratio=0.75, flush_ratio=0.2),
+            short_term=ShortTermMemory(llm=self.client, model=LLM_MODEL, size_ratio=0.25, flush_ratio=0.2),
+            long_term=self.long_term,
+            world_state=WorldStateMemory(),
+        )
+
+        self.agents = AgentRegistry(self.client, LLM_MODEL)
+        self.local_tool_server = LocalToolServer([
+            UserTools(self.robot),
+            MemoryTools(self.long_term),
+            *self.agents.as_tools(),
         ])
-    local_requester = ZMQRpcRequester(LOCAL_TOOLS_ENDPOINT)
-    robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
+        self._local_requester = ZMQRpcRequester(LOCAL_TOOLS_ENDPOINT)
+        self._robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
 
-    try:
-        async with (
-            Client(McpTransport(local_requester, timeout=120.0)) as local_client,
-            Client(McpTransport(robot_requester)) as robot_client,
-        ):
-            tool_engine = ToolEngine(
-                sources={"local": local_client, "robot": robot_client},
-                whitelists={"robot": ROBOT_TOOL_WHITELIST},
-            )
+        # Entered/exited manually (not `async with`) - setup()/cleanup() own their
+        # lifecycle explicitly, same as everything else this class builds.
+        self._local_client = Client(McpTransport(self._local_requester, timeout=120.0))
+        self._robot_client = Client(McpTransport(self._robot_requester))
+        await self._local_client.__aenter__()
+        await self._robot_client.__aenter__()
 
-            await tool_engine.discover()
-            # tool_engine.print_schemas(raw=False)
+        self.tool_engine = ToolEngine(
+            sources={"local": self._local_client, "robot": self._robot_client},
+            whitelists={"robot": ROBOT_TOOL_WHITELIST},
+        )
+        await self.tool_engine.discover()
 
-            llm_engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
+        self.llm_engine = LLMEngine(client=self.client, model=LLM_MODEL,
+                                     memory=self.memory, tool_engine=self.tool_engine)
+        print(self.memory.static)
+        self._start_listening()
+        Logger.info("QTrobot conversation ready. Listening for speech... (Ctrl+C to stop)")
 
-            async def read_input_loop():
-                """Runs input() on a worker thread (via asyncio.to_thread) so it never
-                blocks output_loop below - submit()/cancel() are both non-blocking, so
-                typing a new line while a previous one is still resolving just works,
-                no special-casing needed here."""
-                while True:
-                    user_input = (await asyncio.to_thread(input, "You: ")).strip()
-                    if not user_input:
-                        continue
-                    if user_input == "/exit":
-                        return
-                    if user_input == "/cancel":
-                        llm_engine.cancel()
-                        Logger.info("Cancelled current response.")
-                        continue
-                    if user_input == "/mem":
-                        memory.print()
-                        continue
-                    if user_input == "/mem raw":
-                        memory.print(raw=True)
-                        continue
-                    llm_engine.submit(user_input)
+    def start(self) -> None:
+        """Synchronous entry point - the only method meant to be called from outside
+        an event loop. Runs the whole lifecycle (setup, listen until Ctrl+C,
+        cleanup) via asyncio.run()."""
+        asyncio.run(self._main())
 
-            async def output_loop():
-                """Drains output() forever - sentences arrive from whichever submitted
-                turn produced them, in the order they become ready; None (a completed
-                turn) is just skipped, this loop never stops on its own."""
-                async for item in llm_engine.output():
-                    if item is not None:
-                        Logger.info(f"[SPEAK] {item}")
-                        # handle = robot.tts.say_text_async(item, voice="Rosie")
+    async def _main(self) -> None:
+        await self.setup()
+        try:
+            await self.listen()
+        except KeyboardInterrupt:
+            Logger.info("Interrupted by user.")
+        finally:
+            await self.cleanup()
 
-            Logger.info("Tool-calling demo ready. Try: 'what time is it?', 'what do you see?', "
-                        "'/mem' shows memory ('/mem raw' for raw json memory), '/cancel' cancels "
-                        "the current response, '/exit' close the chat.")
+    async def listen(self) -> None:
+        """Drains LLMEngine.output() forever, speaking each sentence, until
+        cleanup() shuts the engine down and ends the stream.
 
-            output_task = asyncio.create_task(output_loop())
+        await asyncio.to_thread(handle.wait) - not a bare handle.wait() - matters
+        here: ActionHandle.wait() is a plain blocking call, not a coroutine, so
+        calling it directly would stall this whole event loop (and every other task
+        on it, including ASR-driven submit()s) for as long as TTS is speaking."""
+        async for item in self.llm_engine.output():
+            if item is None:
+                continue
             try:
-                await read_input_loop()
-            finally:
-                llm_engine.shutdown()
-                await output_task
-    finally:
-        local_requester.close()
-        robot_requester.close()
-        local_tool_server.terminate(timeout=1.0)
-        agents.cleanup()
-        robot.close()
-        memory.flush_all()
-        long_term.save(LTM_CHAT_HISTORY_PATH)
+                handle = self.robot.tts.say_text_async(item, voice="Rosie")
+                self._speaking_handle = handle
+                await asyncio.to_thread(handle.wait)
+            except Exception as e:
+                Logger.error(f"TTS error: {e}")
+
+    async def cleanup(self) -> None:
+        """Tears everything down, reverse order of setup(). Every step is
+        independently guarded, so this is safe to call even if setup() didn't fully
+        complete."""
+        if self.llm_engine is not None:
+            self.llm_engine.shutdown()
+        if self._local_client is not None:
+            await self._local_client.__aexit__(None, None, None)
+        if self._robot_client is not None:
+            await self._robot_client.__aexit__(None, None, None)
+        if self._local_requester is not None:
+            self._local_requester.close()
+        if self._robot_requester is not None:
+            self._robot_requester.close()
+        if self.local_tool_server is not None:
+            self.local_tool_server.terminate(timeout=1.0)
+        if self.agents is not None:
+            self.agents.cleanup()
+        if self.robot is not None:
+            self.robot.close()
+        if self.memory is not None:
+            self.memory.flush_all()
+        if self.long_term is not None:
+            self.long_term.save(LTM_CHAT_HISTORY_PATH)
+
+    # ------------------------------------------------------------------
+    # ASR - listening setup and callbacks
+    # ------------------------------------------------------------------
+
+    def _start_listening(self) -> None:
+        self.robot.enable_plugin_local("asr-parakeet")
+        self.robot.asr.configure_parakeet(
+            endpoint=PARAKEET_ENDPOINT,
+            language="en",
+            use_vad=True,
+            silence_timeout=0.3,
+            max_buffer_seconds=20.0,
+            continuous_mode=True,
+        )
+        self.robot.asr.stream.on_parakeet_speech(self._on_parakeet_speech)
+        self.robot.asr.stream.on_parakeet_event(self._on_parakeet_event)
+
+    def _on_parakeet_speech(self, speech) -> None:
+        data = speech.value or {}
+        text = data.get("text", "")
+        if not text:
+            return
+
+        if not data.get("is_final"):
+            # Interim result: the user has started talking - treat as barge-in, but
+            # don't submit anything yet, wait for the final transcript.
+            self._trigger_barge_in("interim speech")
+            return
+
+        Logger.info(f"You said: {text}")
+        self.llm_engine.submit(text)
+
+    def _on_parakeet_event(self, event) -> None:
+        Logger.debug(event.value)
+
+    def _trigger_barge_in(self, source: str) -> None:
+        """Stops the robot's own output when the user starts talking over it - see
+        LLMEngine.interrupt() for why this is deliberately narrower than cancel()
+        (doesn't touch in-flight tool/agent calls). No lock around
+        _speaking_handle: a plain attribute is enough - a single reference
+        assignment is already atomic, and ActionHandle's own done()/cancel() are
+        themselves safe to call from any thread."""
+        handle = self._speaking_handle
+        if handle is None or handle.done():
+            return  # nothing playing right now
+        Logger.info(f"Barge-in ({source}): cancelling TTS.")
+        handle.cancel()
+        self.llm_engine.interrupt()
 
 
 if __name__ == "__main__":
     # Logger.set_level("DEBUG")
-    asyncio.run(main())
+    QTrobotAIAgent().start()

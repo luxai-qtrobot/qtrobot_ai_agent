@@ -28,6 +28,17 @@ HEADER = "[World state - background activity and environment, not something the 
 
 class WorldStateMemory(WorldStateMemoryBase):
 
+    USAGE_NOTE = (
+        "A message starting with '[World state ...]' near the end of the "
+        "conversation is not something the user said - it is your own live "
+        "situational awareness: background actions you are currently running "
+        "('[bg action]') and things currently true about your environment "
+        "('[state]'). Use it to answer questions about what you are doing or what "
+        "is around you, and to avoid contradicting yourself about an action that "
+        "already finished or was stopped. If it is absent, nothing notable is "
+        "currently happening in the background."
+    )
+
     def __init__(self):
         self._lock = threading.Lock()
         self._entries: dict[str, str] = {}
