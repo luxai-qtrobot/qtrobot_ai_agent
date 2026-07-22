@@ -89,15 +89,13 @@ class RobotMemory:
     def get(self) -> list[dict]:
         """Assemble static + working's raw messages + short_term summary into the final
         list ready to hand to client.chat.completions.create(messages=...)."""
-        messages = [{"role": "system", "content": self.static}]
-
-        # Right after static, not buried mid-conversation or tacked onto the end like
-        # STM's summary: this is stable/instructional (which documents exist and are
-        # searchable), not a per-turn narrative, so it belongs with the other front-
-        # loaded instructions the model attends to most reliably.
+        # Folded into the one system message rather than a second one: some chat
+        # templates (e.g. Qwen3's) only ever look at messages[0] for role="system"
+        static_content = self.static
         doc_index = self.long_term.document_index_summary() if self.long_term is not None else ""
         if doc_index:
-            messages.append({"role": "system", "content": doc_index})
+            static_content = static_content + "\n\n" + doc_index
+        messages = [{"role": "system", "content": static_content}]
 
         messages.extend(self.working.get())
 
@@ -192,10 +190,8 @@ class RobotMemory:
         if count_messages_tokens(messages) <= self.max_tokens:
             return messages
 
-        # static, plus the doc index right after it if present (see get()) - both are
-        # stable/instructional, never trimmed, same as static always was.
-        has_doc_index = self.long_term is not None and self.long_term.document_index_summary() != ""
-        lead_count = 2 if has_doc_index else 1
+        # static (doc index is folded into it, see get()) - never trimmed.
+        lead_count = 1
         lead_msgs = messages[:lead_count]
 
         # Both the summary and world-state messages are appended, in that order, at

@@ -62,23 +62,18 @@ ROBOT_TOOL_WHITELIST = {
 LLM_API_BASE = "http://192.168.3.111:8080/v1"
 #LLM_API_BASE = "https://api.anthropic.com/v1/"
 LLM_MODEL = "gemma-4-12B-it-Q8_0.gguf"
+# LLM_MODEL = "Qwen3VL-8B-Instruct-Q8_0.gguf"
 # LLM_MODEL = "claude-sonnet-4-6"
 MEMORY_MAX_TOKENS = 31000  # 31k
 
 DOCUMENTS_DIR = Path(__file__).resolve().parent.parent / "documents"
 LTM_CHAT_HISTORY_PATH = Path(__file__).resolve().parent.parent / "data" / "long_term_chat_history.json"
 
-SYSTEM_PROMPT = (
-    "You are QTrobot, a friendly social robot. You are the robot itself, not an "
-    "assistant controlling it. Use the available tools to perceive the environment, "
-    "perform robot actions, search memory, and search user documents. Use tools when "
-    "they improve accuracy or are needed to perform the user's request. Otherwise, "
-    "reply in plain text. Respond as QTrobot, not as an AI assistant. "
-
-    "Keep every spoken response short and natural. Prefer one brief sentence. Avoid "
-    "long sentences, explanations, lists, emojis, repetition, and unnecessary details."
-)
-
+SYSTEM_PROMPT = '''
+You are QTrobot, a friendly social robot.
+You are the robot itself, never an AI assistant or software controlling the robot.
+Speak naturally as QTrobot. Keep spoken responses brief and conversational. Prefer one short sentence. Avoid long explanations, lists, repetition, emojis, and unnecessary details.
+'''
 
 
 DOCUMENTS_SUMMARY = (
@@ -92,24 +87,17 @@ async def main():
     robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
     robot.enable_plugin_zmq("realsense-driver", endpoint=f"tcp://{ROBOT_IP}:50750")
-    
-    # setup 
     robot.speaker.set_volume(0.7)
     robot.motor.home_all()
 
-
-    # Single llm api client
     client = OpenAI(base_url=LLM_API_BASE, api_key="not-needed")
 
-
-    # Robot memmory
     long_term = LongTermMemory()
     long_term.load(LTM_CHAT_HISTORY_PATH)
-
     for doc in DirectoryReader.read(DOCUMENTS_DIR, summary=DOCUMENTS_SUMMARY):
         long_term.add_document(text=doc.text, summary=doc.summary, meta=doc.meta)
         Logger.info(f"Loaded document into long-term memory: {doc.meta['source']}")
-        
+
     memory = RobotMemory(
         static=SYSTEM_PROMPT,
         max_tokens=MEMORY_MAX_TOKENS,
@@ -119,14 +107,12 @@ async def main():
         world_state=WorldStateMemory(),
     )
 
-    # enable agents
     agents = AgentRegistry(client, LLM_MODEL)
-
     local_tool_server = LocalToolServer([
         UserTools(robot),
         MemoryTools(long_term),
-        *agents.as_tools(),
-        ])
+        # *agents.as_tools(),
+    ])
     local_requester = ZMQRpcRequester(LOCAL_TOOLS_ENDPOINT)
     robot_requester = ZMQRpcRequester(ROBOT_ENDPOINT)
 
@@ -141,7 +127,6 @@ async def main():
             )
 
             await tool_engine.discover()
-            # tool_engine.print_schemas(raw=False)
 
             llm_engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
 
@@ -166,6 +151,7 @@ async def main():
                     if user_input == "/mem raw":
                         memory.print(raw=True)
                         continue
+                    Logger.info(f"submited: {user_input}")
                     llm_engine.submit(user_input)
 
             async def output_loop():
@@ -198,5 +184,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Logger.set_level("DEBUG")
+    Logger.set_level("DEBUG")
     asyncio.run(main())

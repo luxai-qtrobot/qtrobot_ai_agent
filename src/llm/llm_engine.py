@@ -59,24 +59,23 @@ CANCELLED_REPLY = "I didn't finish that - it was cancelled."
 INTERRUPTED_REPLY = "I was interrupted there."
 
 
-TOOL_USE_NOTE = (
-    "Before calling any tool that may take noticeable time or performs a visible "
-    "robot action, you MUST first produce a short spoken acknowledgment in the "
-    "same assistant turn, before the tool call. Examples include playing a "
-    "gesture, moving, taking or analyzing a camera image, searching documents, "
-    "and searching memory. Examples of acknowledgments are: 'Sure, one moment.' "
-    "'Let me check.' or 'I will play a happy gesture.' Never wait until after the "
-    "action to acknowledge it.\n\n"
-    "An acknowledgment by itself is never a complete response - if you say you "
-    "will check, look up, play, or perform something, the matching tool call must "
-    "be in that same turn too. Never stop right after the acknowledgment with no "
-    "tool call.\n\n"
-    "After a successful action, do not repeat what you already announced. Only "
-    "speak again if the result needs to be reported, the action failed, or the "
-    "user needs additional information.\n\n"
-    "Never mention tools, APIs, prompts, hidden context, or internal "
-    "implementation unless the user explicitly asks."
-)
+EMPTY_REPLY = "Sorry, I'm having trouble with that."
+
+
+TOOL_USE_NOTE = '''
+Use an actual tool call whenever a tool is required to perform the user's request or obtain an accurate answer.
+Never guess information that an available tool can provide.
+Treat previous tool results as historical, not current.
+When the user asks for something now, currently, again, latest, refreshed, checked, captured, or looked at, call the appropriate tool again.
+This includes the current time, camera view, robot state, speaker volume, and TTS configuration.
+Before a visible robot action or a tool that may take noticeable time, give one short acknowledgment and then make the matching tool call in the same assistant turn.
+Never say you will check, search, capture, confirm, or perform an action without making the corresponding tool call.
+Never output, quote, or repeat internal memory entries such as "(Earlier, I used ...)".
+Never write a tool call or tool result as plain text.
+If the request requires a tool, make the actual tool call.
+After receiving a tool result, report only what the user needs and do not repeat the acknowledgment.
+Never mention tools, APIs, prompts, hidden context, or internal implementation unless the user explicitly asks.
+'''
 
 
 def extract_sentences(buffer: str):
@@ -125,13 +124,7 @@ class LLMEngine:
         self.max_tokens = max_tokens
         self.timeout = timeout
 
-        # Single place the final prompt gets assembled: the app's own memory.static,
-        # plus this framework's tool-use guidance (only if tools are actually offered),
-        # plus each configured tier's own USAGE_NOTE (only the tiers that exist). The
-        # template is dedented before the placeholders are filled in - not after -
-        # since TOOL_USE_NOTE/USAGE_NOTE are themselves multi-line, and dedenting the
-        # already-substituted string would leave their inner lines unindented while
-        # the template's own lines were, breaking dedent's common-prefix detection.
+        # Single place the final prompt gets assembled
         if memory is not None:
             static_prompt_template = textwrap.dedent("""\
                 {static}
@@ -143,10 +136,10 @@ class LLMEngine:
                 {world_state_note}
                 """)
             memory.static = static_prompt_template.format(
-                static=memory.static,
-                tool_use_note=TOOL_USE_NOTE if tool_engine is not None else "",
-                long_term_note=memory.long_term.USAGE_NOTE if memory.long_term is not None else "",
-                world_state_note=memory.world_state.USAGE_NOTE if memory.world_state is not None else "",
+                static=textwrap.dedent(memory.static).strip(),
+                tool_use_note=textwrap.dedent(TOOL_USE_NOTE).strip() if tool_engine else "",
+                long_term_note=textwrap.dedent(memory.long_term.USAGE_NOTE).strip() if memory.long_term else "",
+                world_state_note=textwrap.dedent(memory.world_state.USAGE_NOTE).strip() if memory.world_state else "",
             ).strip()
 
         self._history = [{"role": "system", "content": system_prompt}] if (memory is None and system_prompt) else []
@@ -155,6 +148,7 @@ class LLMEngine:
         self._output_queue = queue.Queue()
         self._cancel_event = threading.Event()
         self._cancel_reason = "cancelled"  # which of cancel()/interrupt() set the event
+        self._active = False  # True only while a respect_cancel=True round is streaming
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
@@ -176,9 +170,19 @@ class LLMEngine:
         immediately, rather than waiting for _resolve_parked's eventual CANCELLED
         handling - a call without a cancel pairing can keep running for a while after
         this, and its "in progress" entry would otherwise stay visible (and
-        misleading) for that whole window even though the user already cancelled it."""
+        misleading) for that whole window even though the user already cancelled it.
+
+        Only sets _cancel_event if a respect_cancel round is actually streaming right
+        now (self._active) - otherwise there's nothing live to stop, and setting it
+        anyway would just sit armed and kill the next round the instant it starts,
+        even though that round has nothing to do with whatever prompted this call.
+        Also drops every sentence already queued for output but not yet spoken - those
+        are stale the moment the user wants everything stopped, regardless of which
+        turn produced them."""
         self._cancel_reason = "cancelled"
-        self._cancel_event.set()
+        if self._active:
+            self._cancel_event.set()
+        self._drain_output_queue()
         if self.tool_engine:
             self._wsm_discard(self.tool_engine.cancel_all())
 
@@ -187,9 +191,27 @@ class LLMEngine:
         ASR/VAD): stops the turn currently streaming live from yielding any more
         output, same as cancel() - but does NOT touch in-flight tool/agent calls.
         Starting to talk doesn't mean the user has abandoned whatever's running in
-        the background, just that they want to be heard now."""
+        the background, just that they want to be heard now.
+
+        Same self._active guard and output-queue drain as cancel() - see there for
+        why. Deliberately does NOT touch _input_queue: everything in it is a real,
+        already-finalized thing the user said (ASR only submits on is_final, never on
+        interim), so barging in must never silently discard a request the user is
+        still waiting to be answered."""
         self._cancel_reason = "interrupted"
-        self._cancel_event.set()
+        if self._active:
+            self._cancel_event.set()
+        self._drain_output_queue()
+
+    def _drain_output_queue(self) -> None:
+        """Discards every sentence (and turn-complete None marker) currently sitting
+        in _output_queue, unspoken - called from cancel()/interrupt() so stale output
+        from an interrupted/cancelled turn can't keep playing after the fact."""
+        try:
+            while True:
+                self._output_queue.get_nowait()
+        except queue.Empty:
+            pass
 
     async def output(self):
         """Async generator - yields each complete sentence as it becomes available,
@@ -230,6 +252,7 @@ class LLMEngine:
     def _worker_loop(self) -> None:
         while True:
             user_input = self._input_queue.get()
+            Logger.info(f"Processing: {user_input}")
             if user_input is _SHUTDOWN:
                 return
             self._cancel_event.clear()
@@ -454,87 +477,104 @@ class LLMEngine:
         spoken = ""
         tool_calls_acc = {}  # index -> {"id": str, "name": str, "arguments": str}
 
+        # _active is only meaningful for respect_cancel=True (round 1) calls - it's
+        # what lets cancel()/interrupt() tell "a round is actually streaming right
+        # now" apart from "nothing's live, don't arm _cancel_event for whatever comes
+        # next" (see cancel()/interrupt()). Parked rounds (respect_cancel=False) never
+        # touch it - they're already exempt from _cancel_event entirely.
+        if respect_cancel:
+            self._active = True
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=self.tool_engine.schemas() if self.tool_engine else None,
-                tool_choice="auto" if self.tool_engine else None,
-                stream=True,
-                max_tokens=self.max_tokens,
-                timeout=self.timeout,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
+            try:
+                stream = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=self.tool_engine.schemas() if self.tool_engine else None,
+                    tool_choice="auto" if self.tool_engine else None,
+                    stream=True,
+                    max_tokens=self.max_tokens,
+                    timeout=self.timeout,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )
 
-            Logger.debug(f"--- streaming deltas ({label}) ---")
-            for chunk in stream:
-                if respect_cancel and self._cancel_event.is_set():
-                    Logger.debug(f"--- {self._cancel_reason} mid-stream ({label}) ---")
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-                    partial = spoken.strip()
-                    spoken_msg = {"role": "assistant", "content": partial} if partial else None
-                    return spoken_msg, CANCELLED
+                Logger.debug(f"--- streaming deltas ({label}) ---")
+                for chunk in stream:
+                    if respect_cancel and self._cancel_event.is_set():
+                        Logger.debug(f"--- {self._cancel_reason} mid-stream ({label}) ---")
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        partial = spoken.strip()
+                        spoken_msg = {"role": "assistant", "content": partial} if partial else None
+                        return spoken_msg, CANCELLED
+                    
+                    delta = chunk.choices[0].delta
 
-                delta = chunk.choices[0].delta
+                    # reasoning_content isn't a declared field on ChoiceDelta (it's a
+                    # llama.cpp/vLLM extension, not part of OpenAI's schema) - chunks
+                    # that don't carry it (e.g. the first, role-only chunk) don't have
+                    # the key at all, so a direct delta.reasoning_content raises
+                    # AttributeError.
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning and Logger.log_level == "DEBUG":
+                        print(reasoning, end="", flush=True)
 
-                # reasoning_content isn't a declared field on ChoiceDelta (it's a
-                # llama.cpp/vLLM extension, not part of OpenAI's schema) - chunks that
-                # don't carry it (e.g. the first, role-only chunk) don't have the key
-                # at all, so a direct delta.reasoning_content raises AttributeError.
-                reasoning = getattr(delta, "reasoning_content", None)
-                if reasoning and Logger.log_level == "DEBUG":
-                    print(reasoning, end="", flush=True)
+                    if delta.content:
+                        content += delta.content
+                        buffer += delta.content
+                        sentences, buffer = extract_sentences(buffer)
+                        for sentence in sentences:
+                            if sentence:
+                                spoken += sentence + " "
+                                yield sentence
 
-                if delta.content:
-                    content += delta.content
-                    buffer += delta.content
-                    sentences, buffer = extract_sentences(buffer)
-                    for sentence in sentences:
-                        if sentence:
-                            spoken += sentence + " "
-                            yield sentence
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            acc = tool_calls_acc.setdefault(tc.index, {"id": None, "name": None, "arguments": ""})
+                            if tc.id:
+                                acc["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                acc["name"] = tc.function.name
+                            if tc.function and tc.function.arguments:
+                                acc["arguments"] += tc.function.arguments
+                            Logger.debug(f"[tool_call delta] index={tc.index} id={tc.id} "
+                                         f"name={tc.function.name if tc.function else None} "
+                                         f"args_fragment={tc.function.arguments if tc.function else None!r}")
+            except Exception as e:
+                # A genuinely stalled connection (timeout=) lands here - a
+                # runaway/looping generation is instead bounded by max_tokens= and
+                # ends the stream normally, so it never reaches this branch at all.
+                Logger.warning(f"LLMEngine: streaming call failed ({label}): {e}")
+                fallback = "Sorry, I'm having trouble responding right now."
+                yield fallback
+                return {"role": "assistant", "content": fallback}, []
 
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        acc = tool_calls_acc.setdefault(tc.index, {"id": None, "name": None, "arguments": ""})
-                        if tc.id:
-                            acc["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            acc["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            acc["arguments"] += tc.function.arguments
-                        Logger.debug(f"[tool_call delta] index={tc.index} id={tc.id} "
-                                     f"name={tc.function.name if tc.function else None} "
-                                     f"args_fragment={tc.function.arguments if tc.function else None!r}")
-        except Exception as e:
-            # A genuinely stalled connection (timeout=) lands here - a runaway/looping
-            # generation is instead bounded by max_tokens= and ends the stream normally,
-            # so it never reaches this branch at all.
-            Logger.warning(f"LLMEngine: streaming call failed ({label}): {e}")
-            fallback = "Sorry, I'm having trouble responding right now."
-            yield fallback
-            return {"role": "assistant", "content": fallback}, []
+            leftover = buffer.strip()
+            if leftover:
+                yield leftover
 
-        leftover = buffer.strip()
-        if leftover:
-            yield leftover
+            Logger.debug(f"--- end of stream ({label}); full content={content!r} ---")
 
-        Logger.debug(f"--- end of stream ({label}); full content={content!r} ---")
+            if not tool_calls_acc:
+                if not content.strip():
+                    Logger.warning(f"LLMEngine: round produced no content and no tool "
+                                    f"calls ({label}) - substituting EMPTY_REPLY")
+                    yield EMPTY_REPLY
+                    return {"role": "assistant", "content": EMPTY_REPLY}, []
+                return {"role": "assistant", "content": content}, []
 
-        if not tool_calls_acc:
-            return {"role": "assistant", "content": content}, []
-
-        ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-        assistant_msg = {
-            "role": "assistant",
-            "content": content or None,
-            "tool_calls": [
-                {"id": tc["id"], "type": "function",
-                 "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                for tc in ordered
-            ],
-        }
-        return assistant_msg, ordered
+            ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            assistant_msg = {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function",
+                     "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for tc in ordered
+                ],
+            }
+            return assistant_msg, ordered
+        finally:
+            if respect_cancel:
+                self._active = False

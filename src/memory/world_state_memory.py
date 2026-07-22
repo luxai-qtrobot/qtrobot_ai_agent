@@ -28,16 +28,13 @@ HEADER = "[World state - background activity and environment, not something the 
 
 class WorldStateMemory(WorldStateMemoryBase):
 
-    USAGE_NOTE = (
-        "A message starting with '[World state ...]' near the end of the "
-        "conversation is not something the user said - it is your own live "
-        "situational awareness: background actions you are currently running "
-        "('[bg action]') and things currently true about your environment "
-        "('[state]'). Use it to answer questions about what you are doing or what "
-        "is around you, and to avoid contradicting yourself about an action that "
-        "already finished or was stopped. If it is absent, nothing notable is "
-        "currently happening in the background."
-    )
+    USAGE_NOTE = '''
+        A message beginning with "[World state ...]" is live system context, not something the user said.
+        Entries marked "[bg action]" describe actions currently running.
+        Entries marked "[state]" describe things currently true about the robot or its environment.
+        Use this information to answer questions about current actions or surroundings and avoid contradicting the current state.
+        If no world-state message is present, assume no special background activity or state is known.
+    '''
 
     def __init__(self):
         self._lock = threading.Lock()

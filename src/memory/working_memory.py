@@ -145,8 +145,16 @@ class WorkingMemory(WorkingMemoryBase):
 
     def _compact_tool_exchanges(self, messages: list[dict]) -> list[dict]:
         """Replace each assistant tool_calls + matching tool-result messages with one
-        short summary line ('name(args) -> result'), long results truncated. Everything
-        else (plain text turns, image messages) passes through untouched."""
+        short narrated summary line, long results truncated. Everything else (plain
+        text turns, image messages) passes through untouched.
+
+        Deliberately phrased as prose ('(Earlier, I used X with Y, result: Z)'), not
+        code/function-call syntax ('name(args) -> result') - a weaker model can and
+        does pattern-match on whatever shape it keeps seeing in its own context, and a
+        call-shaped summary line reappearing turn after turn was observed to get
+        literally copied back out as fake "content" (looking like a real tool call)
+        instead of the model making an actual tool call - see llm_engine.py's
+        TOOL_USE_NOTE for the matching instruction-level guard."""
         results = {
             m["tool_call_id"]: str(m.get("content") or "")
             for m in messages if m.get("role") == "tool"
@@ -165,8 +173,8 @@ class WorkingMemory(WorkingMemoryBase):
                     result = results.get(tc["id"], "")
                     if len(result) > COMPACTED_RESULT_CHARS:
                         result = result[:COMPACTED_RESULT_CHARS] + f"...<{len(result)} chars>"
-                    actions.append(f"{name}({args}) -> {result}")
-                compacted.append({"role": "assistant", "content": "[tool actions] " + "; ".join(actions)})
+                    actions.append(f"used {name} with {args}, result: {result}")
+                compacted.append({"role": "assistant", "content": "(Earlier, I " + "; ".join(actions) + ")"})
                 if msg.get("content"):
                     compacted.append({"role": "assistant", "content": msg["content"]})
             else:

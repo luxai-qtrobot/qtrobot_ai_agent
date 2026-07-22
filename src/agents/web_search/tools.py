@@ -8,6 +8,7 @@ conversation's ToolEngine.
 
 import os
 
+import requests
 import trafilatura
 from tavily import TavilyClient
 
@@ -16,6 +17,7 @@ from luxai.magpie.schema import McpSchema
 from tool.tool_base import ToolBase
 
 MAX_RESULTS = 5
+FETCH_TIMEOUT_SECONDS = 10
 
 
 class WebSearchTools(ToolBase):
@@ -45,9 +47,19 @@ class WebSearchTools(ToolBase):
         ]
 
     def fetch_url(self, url: str) -> str:
-        """Fetch a URL and return its extracted main text content."""
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            return f"Could not fetch {url}."
-        text = trafilatura.extract(downloaded)
+        """Fetch a URL and return its extracted main text content.
+
+        Uses requests (not trafilatura.fetch_url) for the actual network call
+        specifically for its timeout= - trafilatura.fetch_url has no reliable way to
+        bound how long it blocks, and a hung fetch on the tool server's shared,
+        fixed-size worker pool (see ServerNode/LocalToolServer) was observed starving
+        every other tool call queued behind it for minutes. trafilatura.extract()
+        itself only parses already-downloaded HTML, so splitting fetch from extract
+        loses nothing."""
+        try:
+            response = requests.get(url, timeout=FETCH_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            return f"Could not fetch {url}: {e}"
+        text = trafilatura.extract(response.text)
         return text or f"No readable content found at {url}."
