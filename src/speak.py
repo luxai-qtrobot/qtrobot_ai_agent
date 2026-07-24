@@ -29,22 +29,37 @@ class Speaker:
     # otherwise mean "nothing to compare against".
     ECHO_GRACE_SECONDS = 2.0
 
-    def __init__(self, robot, enable_barge_in: bool = True, on_barge_in=None, engine: str = "azure"):
+    # Minimum interim-text length (characters) before treating it as a real
+    # barge-in attempt rather than acting on the very first interim callback,
+    # which can be a single fragment or word. "low" requires a more substantial
+    # fragment before reacting - safest when the mic's echo cancellation is
+    # unreliable and prone to leaking brief noise/echo into interim results;
+    # "high" reacts immediately to any interim result, even one character.
+    BARGE_IN_SENSITIVITY = {
+        "high": 0,
+        "moderate": 6,
+        "low": 15,
+    }
+
+    def __init__(self, robot, enable_barge_in: bool = True, on_barge_in=None, engine: str = "azure",
+                 barge_in_sensitivity: str = "moderate"):
         """
-        robot:            a connected Robot instance - talk() calls robot.tts.say_text_async().
-        enable_barge_in:  if False, on_interim_speech()/is_echo() are no-ops - useful
-                          for testing/tuning without barge-in interfering.
-        on_barge_in:      called (no args) when a real barge-in happens - e.g.
-                          llm_engine.interrupt(). Plain callback, not an LLMEngine
-                          reference, so this class stays independently testable and
-                          reusable outside this one app (same pattern as
-                          WorkingMemory.bind(max_tokens, on_evict=...)).
-        engine:           TTS engine name passed to every say_text_async() call.
+        robot:                 a connected Robot instance - talk() calls robot.tts.say_text_async().
+        enable_barge_in:       if False, on_interim_speech()/is_echo() are no-ops -
+                               useful for testing/tuning without barge-in interfering.
+        on_barge_in:           called (no args) when a real barge-in happens - e.g.
+                               llm_engine.interrupt(). Plain callback, not an LLMEngine
+                               reference, so this class stays independently testable
+                               and reusable outside this one app (same pattern as
+                               WorkingMemory.bind(max_tokens, on_evict=...)).
+        engine:                TTS engine name passed to every say_text_async() call.
+        barge_in_sensitivity:  one of BARGE_IN_SENSITIVITY's keys - see there.
         """
         self._robot = robot
         self._enable_barge_in = enable_barge_in
         self._on_barge_in = on_barge_in
         self._engine = engine
+        self._min_interim_chars = self.BARGE_IN_SENSITIVITY[barge_in_sensitivity]
         self._lock = threading.Lock()
         self._handle = None
         self._text = ""
@@ -68,8 +83,11 @@ class Speaker:
 
     def on_interim_speech(self, text: str = "") -> None:
         """Call from the ASR interim-speech callback. Cancels in-flight TTS unless
-        nothing's playing or text looks like the mic picking up our own speech."""
+        nothing's playing, the fragment is too short to trust yet (see
+        BARGE_IN_SENSITIVITY), or text looks like the mic picking up our own speech."""
         if not self._enable_barge_in:
+            return
+        if len(text.strip()) < self._min_interim_chars:
             return
         with self._lock:
             if self._handle is None or (text and self._is_echo_locked(text)):

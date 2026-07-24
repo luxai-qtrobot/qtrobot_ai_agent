@@ -35,7 +35,7 @@ from memory.world_state_memory import WorldStateMemory
 from agents.agent_registry import AgentRegistry
 
 ROBOT_IP = "192.168.3.111"
-ROBOT_ENDPOINT = f"tcp://{ROBOT_IP}:50500"
+ROBOT_ENDPOINT = f"tcp://192.168.3.106:50500"
 PARAKEET_ENDPOINT = f"tcp://{ROBOT_IP}:50860"
 REALSENSE_ENDPOINT = f"tcp://{ROBOT_IP}:50750"
 
@@ -68,6 +68,7 @@ SYSTEM_PROMPT = '''
 You are QTrobot, a friendly social robot.
 You are the robot itself, never an AI assistant or software controlling the robot.
 Speak naturally as QTrobot. Keep spoken responses brief and conversational. Prefer one short sentence. Avoid long explanations, lists, repetition, emojis, and unnecessary details.
+You can communicate with the user in the following supported languages: English, Bulgarian, Croatian, Czech, Danish, Dutch, Estonian, Finnish, French, German, Greek, Hungarian, Italian, Latvian, Lithuanian, Maltese, Polish, Portuguese (Portugal & Brazil), Romanian, Russian, Slovak, Slovenian, Spanish (Spain & US), Swedish, and Ukrainian. Detect the user's language automatically and respond in that language whenever possible.
 '''
 
 
@@ -84,7 +85,7 @@ async def main():
     robot.enable_plugin_zmq("realsense-driver", endpoint=REALSENSE_ENDPOINT)
     robot.speaker.set_volume(0.8)
     robot.motor.home_all()
-    robot.tts.set_default_engine("azure")
+    robot.tts.set_default_engine("acapela")
     
     tuning_params = { "AGCONOFF": 0, "AGCGAIN": 30, }
     for name, value in tuning_params.items():        
@@ -130,7 +131,8 @@ async def main():
             await tool_engine.discover()
 
             llm_engine = LLMEngine(client=client, model=LLM_MODEL, memory=memory, tool_engine=tool_engine)
-            speaker = Speaker(robot, enable_barge_in=True, on_barge_in=llm_engine.interrupt, engine="azure")
+            speaker = Speaker(robot, enable_barge_in=True, on_barge_in=llm_engine.interrupt,
+                               engine="acapela", barge_in_sensitivity="low")
 
             def on_parakeet_speech(speech):
                 data = speech.value or {}
@@ -153,7 +155,7 @@ async def main():
                 endpoint=PARAKEET_ENDPOINT,
                 language="en",
                 use_vad=True,
-                silence_timeout=0.3,
+                silence_timeout=0.6,
                 max_buffer_seconds=20.0,
                 continuous_mode=True,
             )
