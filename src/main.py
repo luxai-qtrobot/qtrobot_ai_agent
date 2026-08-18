@@ -34,32 +34,36 @@ from memory.working_memory import WorkingMemory
 from memory.world_state_memory import WorldStateMemory
 from agents.agent_registry import AgentRegistry
 
-ROBOT_IP = "192.168.3.111"
-ROBOT_ENDPOINT = f"tcp://192.168.3.106:50500"
-PARAKEET_ENDPOINT = f"tcp://{ROBOT_IP}:50860"
-REALSENSE_ENDPOINT = f"tcp://{ROBOT_IP}:50750"
+
+ROBOT_ENDPOINT = f"tcp://192.168.3.109:50500"
+PARAKEET_ENDPOINT = f"tcp://192.168.3.109:50860"
+REALSENSE_ENDPOINT = f"tcp://192.168.3.109:50750"
 
 # tool_name -> cancel_tool_name | None - see ToolEngine.cancel_all(). Left None for
 # now (fill in the robot's real cancel-service tool names, e.g. gesture_file_play ->
 # gesture_file_cancel, when this connection is actually re-enabled).
 ROBOT_TOOL_WHITELIST = {
     "tts_engine_languages_get": None,    
-    "face_emotion_list": None,
-    "face_emotion_show": None,
-    "face_emotion_stop": None,
-    "gesture_cancel": None,
-    "gesture_file_list": None,
-    "gesture_file_play": None,
-    "motor_move_home_all": None,
+    # "face_emotion_list": None,
+    # "face_emotion_show": None,
+    # "face_emotion_stop": None,
+    # "gesture_cancel": None,
+    # "gesture_file_list": None,
+    # "gesture_file_play": None,
+    # "motor_move_home_all": None,
     "speaker_volume_get": None,
     "speaker_volume_set": None,
 }
 
-LLM_API_BASE = "http://192.168.3.111:8080/v1"
-# LLM_API_BASE = "https://api.anthropic.com/v1/"
-LLM_MODEL = "gemma-4-12B-it-Q8_0.gguf"
+LLM_API_BASE = "http://192.168.3.109:8080/v1"
+LLM_MODEL = "gemma-4-12b-it-UD-Q4_K_XL.gguf"
+
+# LLM_MODEL = "LFM2.5-2.6B-Q6_K.gguf"
+# LLM_MODEL = "LFM2.5-1.2B-Instruct-Q6_K.gguf"
 # LLM_MODEL = "Qwen3VL-8B-Instruct-Q8_0.gguf"
 # LLM_MODEL = "claude-sonnet-4-6"
+# LLM_API_BASE = "https://api.anthropic.com/v1/"
+
 MEMORY_MAX_TOKENS = 31000  # 31k
 
 DOCUMENTS_DIR = Path(__file__).resolve().parent.parent / "documents"
@@ -83,11 +87,14 @@ async def main():
     robot = Robot.connect_zmq(endpoint=ROBOT_ENDPOINT)
     Logger.info(f"Connected to {robot.robot_id} ({robot.robot_type}), SDK version: {robot.sdk_version}")
     robot.enable_plugin_zmq("realsense-driver", endpoint=REALSENSE_ENDPOINT)
-    robot.speaker.set_volume(0.8)
+    robot.speaker.set_volume(0.75)
+    Logger.info(f"Current volume {robot.speaker.get_volume()}")
+
     robot.motor.home_all()
     robot.tts.set_default_engine("acapela")
+    # robot.tts.set_config({'voice': 'en-GB-MaisieNeural'}, engine='acapela')
     
-    tuning_params = { "AGCONOFF": 0, "AGCGAIN": 30, }
+    tuning_params = { "AGCONOFF": 0, "AGCGAIN": 15, }
     for name, value in tuning_params.items():        
         ok = robot.microphone.set_int_tuning(name=name, value=value)
         Logger.info(f"set_int_tuning({name}, {value}) result: {ok}")

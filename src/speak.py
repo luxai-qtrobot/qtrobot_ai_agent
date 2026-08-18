@@ -85,6 +85,7 @@ class Speaker:
         """Call from the ASR interim-speech callback. Cancels in-flight TTS unless
         nothing's playing, the fragment is too short to trust yet (see
         BARGE_IN_SENSITIVITY), or text looks like the mic picking up our own speech."""
+        Logger.debug(text)
         if not self._enable_barge_in:
             return
         if len(text.strip()) < self._min_interim_chars:
