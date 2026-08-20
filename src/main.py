@@ -39,10 +39,9 @@ from tool import (
 )
 
 
-HUMAN_IDLE_ATTENTION_TIMEOUT   = 5.0
-HUMAN_LOOK_VELOCITY            = 60
+HUMAN_IDLE_ATTENTION_TIMEOUT   = 8.0
 MCP_CALL_TIMEOUT_SECONDS       = 120.0
-DEFAULT_AGENT_LLM_BASE_URL     = "http://192.168.3.109:8080/v1"
+DEFAULT_AGENT_LLM_BASE_URL     = "http://127.0.0.1:8080/v1"
 DEFAULT_AGENT_LLM_MODEL        = "gemma-4-12b-it-Q8_0.gguf"
 AGENT_LLM_TIMEOUT_SECONDS      = 60.0
 RUNTIME_SETTING_TIMEOUT_SECONDS = 15.0
@@ -339,7 +338,7 @@ async def run(config: AppConfig) -> None:
                 robot,
                 detector_endpoint=str(parameters.human_attention.detector_endpoint),
                 idle_attention_timeout=HUMAN_IDLE_ATTENTION_TIMEOUT,
-                look_velocity=HUMAN_LOOK_VELOCITY,
+                look_velocity=60,
             )
 
         microphone = RobotMicSource(robot, asyncio.get_running_loop())

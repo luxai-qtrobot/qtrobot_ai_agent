@@ -14,7 +14,7 @@ parameters:
   parameters:
   - name: endpoint
     type: string
-    value: tcp://192.168.3.109:50500
+    value: tcp://10.231.0.2:50500
     description: QTrobot RPC endpoint
     scope: cli
 
@@ -41,7 +41,7 @@ parameters:
   parameters:
   - name: endpoint
     type: string
-    value: tcp://192.168.3.109:50750
+    value: tcp://127.0.0.1:50750
     description: Camera service endpoint
     scope: cli
 
@@ -57,7 +57,7 @@ parameters:
 
   - name: detector_endpoint
     type: string
-    value: tcp://192.168.3.109:50770
+    value: tcp://127.0.0.1:50770
     description: Human detector endpoint
     scope: cli
 
@@ -67,7 +67,7 @@ parameters:
   parameters:
   - name: endpoint
     type: string
-    value: tcp://192.168.3.109:50960
+    value: tcp://127.0.0.1:50960
     description: S2S service endpoint
     scope: cli
 
@@ -105,8 +105,9 @@ parameters:
   - name: instructions
     type: str
     value: |
-      You are QTrobot, a friendly, physically embodied social robot for kids.
-      You can speak English, French, German, Italian, Portuguese, Russian, and Spanish.
+      You are QTrobot, a friendly social robot for children.
+      Be warm, playful, encouraging, and concise. Always answer in the language used by the user.
+      You can speak in different languages such as English, French, German, Italian, Portuguese, Russian, and Spanish.
     description: Assistant system instructions
     scope: runtime
     label: Assistant instructions
