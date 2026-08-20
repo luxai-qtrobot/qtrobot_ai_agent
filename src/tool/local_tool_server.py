@@ -1,10 +1,6 @@
-"""
-local_tool_server.py - LocalToolServer: a single in-process MCP server (one
-McpSchema, one ZMQRpcResponder, one ServerNode) that hosts tool methods contributed
-by any number of ToolBase providers (UserTools, MemoryTools, ...), so adding a new
-local tool group never means standing up another ServerNode/responder/endpoint pair.
-See tool_base.py for the provider contract.
-"""
+"""One in-process MCP server shared by application-owned tool providers."""
+
+from collections.abc import Iterable
 
 from luxai.magpie.nodes import ServerNode
 from luxai.magpie.schema import McpSchema
@@ -13,19 +9,23 @@ from luxai.magpie.utils import Logger
 
 from .tool_base import ToolBase
 
-LOCAL_TOOLS_ENDPOINT = "inproc://local-tools"
+
+LOCAL_TOOLS_ENDPOINT = "inproc://qtrobot-s2s-local-tools"
 
 
 class LocalToolServer(ServerNode):
-
-    def __init__(self, providers: list[ToolBase], endpoint: str = LOCAL_TOOLS_ENDPOINT):
-        self._providers = providers
+    def __init__(
+        self,
+        providers: Iterable[ToolBase],
+        endpoint: str = LOCAL_TOOLS_ENDPOINT,
+    ) -> None:
+        self._providers = tuple(providers)
         schema = McpSchema(name="local-tools", version="1.0.0")
-        for provider in providers:
+        for provider in self._providers:
             provider.register(schema)
 
-        # Providers must be registered above before this runs - BaseNode.__init__()
-        # starts the request-handling thread as its very last step.
+        # ServerNode starts request handling during construction, so all methods
+        # must be registered before its responder is passed to the base class.
         responder = ZMQRpcResponder(endpoint, schema=schema)
         super().__init__(name="local-tool-server", responder=responder)
 
@@ -33,6 +33,9 @@ class LocalToolServer(ServerNode):
         for provider in self._providers:
             try:
                 provider.cleanup()
-            except Exception as e:
-                Logger.warning(f"{self.name}: error cleaning up {provider}: {e}")
+            except Exception as exc:
+                Logger.warning(
+                    f"{self.name}: error cleaning up "
+                    f"{type(provider).__name__}: {exc}"
+                )
         super().cleanup()

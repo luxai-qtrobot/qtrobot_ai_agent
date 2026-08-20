@@ -1,36 +1,34 @@
-"""
-tools.py - WebSearchTools: the web-search sub-agent's own internal tools, backed by a
-real search provider (Tavily) and real page fetching (trafilatura). Registered onto
-the shared agent-tools server (see cli_chat_example.py) and reached only through this
-agent's own scoped ToolEngine (via AgentBase's whitelist) - never exposed to the main
-conversation's ToolEngine.
-"""
+"""Private Tavily and page extraction tools for the web-search agent."""
+
+from __future__ import annotations
 
 import os
+from urllib.parse import urlparse
 
 import requests
 import trafilatura
-from tavily import TavilyClient
-
 from luxai.magpie.schema import McpSchema
+from tavily import TavilyClient
 
 from tool.tool_base import ToolBase
 
+
 MAX_RESULTS = 5
+SEARCH_TIMEOUT_SECONDS = 15
 FETCH_TIMEOUT_SECONDS = 10
+MAX_FETCH_CHARACTERS = 20_000
 
 
 class WebSearchTools(ToolBase):
+    """Network tools exposed only to :class:`WebSearchAgent`."""
 
-    def __init__(self, api_key: str = None):
-        """api_key: Tavily API key. Falls back to the TAVILY_API_KEY environment
-        variable if not given - never hardcode a real key in source."""
+    def __init__(self, api_key: str | None = None) -> None:
         super().__init__()
         api_key = api_key or os.environ.get("TAVILY_API_KEY")
         if not api_key:
             raise ValueError(
-                "WebSearchTools needs a Tavily API key - pass api_key= or set "
-                "the TAVILY_API_KEY environment variable."
+                "WebSearchTools needs a Tavily API key; pass api_key or set "
+                "TAVILY_API_KEY"
             )
         self._client = TavilyClient(api_key=api_key)
 
@@ -38,28 +36,36 @@ class WebSearchTools(ToolBase):
         schema.method()(self.search_web_api)
         schema.method()(self.fetch_url)
 
-    def search_web_api(self, query: str) -> list[dict]:
-        """Run a web search and return raw results (title, url, snippet)."""
-        response = self._client.search(query, max_results=MAX_RESULTS)
+    def search_web_api(self, query: str) -> list[dict[str, str]]:
+        """Search the web and return up to five titles, URLs, and snippets."""
+        response = self._client.search(
+            query,
+            max_results=MAX_RESULTS,
+            timeout=SEARCH_TIMEOUT_SECONDS,
+        )
         return [
-            {"title": r["title"], "url": r["url"], "snippet": r["content"]}
-            for r in response.get("results", [])
+            {
+                "title": str(result.get("title") or ""),
+                "url": str(result.get("url") or ""),
+                "snippet": str(result.get("content") or ""),
+            }
+            for result in response.get("results", [])[:MAX_RESULTS]
         ]
 
     def fetch_url(self, url: str) -> str:
-        """Fetch a URL and return its extracted main text content.
-
-        Uses requests (not trafilatura.fetch_url) for the actual network call
-        specifically for its timeout= - trafilatura.fetch_url has no reliable way to
-        bound how long it blocks, and a hung fetch on the tool server's shared,
-        fixed-size worker pool (see ServerNode/LocalToolServer) was observed starving
-        every other tool call queued behind it for minutes. trafilatura.extract()
-        itself only parses already-downloaded HTML, so splitting fetch from extract
-        loses nothing."""
+        """Fetch an HTTP(S) page and return bounded extracted main text."""
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "Could not fetch URL: only valid HTTP and HTTPS URLs are allowed."
         try:
             response = requests.get(url, timeout=FETCH_TIMEOUT_SECONDS)
             response.raise_for_status()
-        except requests.RequestException as e:
-            return f"Could not fetch {url}: {e}"
+        except requests.RequestException as exc:
+            return f"Could not fetch {url}: {exc}"
+
         text = trafilatura.extract(response.text)
-        return text or f"No readable content found at {url}."
+        if not text:
+            return f"No readable content found at {url}."
+        if len(text) > MAX_FETCH_CHARACTERS:
+            return text[:MAX_FETCH_CHARACTERS] + "\n[content truncated]"
+        return text

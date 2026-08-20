@@ -1,28 +1,28 @@
-"""
-tool_base.py - ToolBase: contract for a tool provider hosted by LocalToolServer
-(local_tool_server.py).
-
-Each provider owns a related group of tool methods (e.g. camera/datetime, memory
-retrieval) and registers them onto a schema shared with the other providers -
-LocalToolServer is the one thing that actually owns the MCP server/responder/endpoint,
-so a provider never touches transport/threading concerns itself.
-"""
+"""Contract implemented by providers hosted in the local MCP server."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import Any
 
 from luxai.magpie.schema import McpSchema
 
 
 class ToolBase(ABC):
+    def __init__(
+        self,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.event_sink = event_sink
+
+    def emit_event(self, event: dict[str, Any]) -> None:
+        """Publish an application event from a background-capable tool."""
+        if self.event_sink is None:
+            raise RuntimeError(f"{type(self).__name__} has no event sink")
+        self.event_sink(event)
 
     @abstractmethod
     def register(self, schema: McpSchema) -> None:
-        """Register this provider's tool methods onto schema, e.g.
-        schema.method()(self.my_tool)."""
-        ...
+        """Register this provider's methods on ``schema``."""
 
     def cleanup(self) -> None:
-        """Called once by LocalToolServer.cleanup() on shutdown - override if this
-        provider holds a resource that needs closing (e.g. an open camera reader).
-        No-op by default."""
-        pass
+        """Release resources owned by the provider."""

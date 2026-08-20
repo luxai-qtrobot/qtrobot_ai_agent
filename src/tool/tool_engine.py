@@ -1,303 +1,385 @@
-"""
-tool_engine.py - ToolEngine: merges tools from one or more MCP clients (robot,
-user-defined, ...) into a single OpenAI-compatible tool schema, with concurrent,
-error-safe dispatch.
+"""Discover and execute tools exposed by one or more MCP servers."""
 
-The tool schema list and the dispatch table are built from the same discovery pass,
-so the LLM can never be offered a tool we can't actually route a call to.
-
-Cancellation: a whitelist entry can pair a tool with its own cancel tool (e.g.
-gesture_file_play -> gesture_file_cancel, matching how the robot SDK's own
-ActionHandle.cancel() already works - a separate RPC to a cancel_service_name, with
-the original call expected to resolve on its own once the action honours the stop).
-cancel_all() dispatches that pairing for every currently in-flight call and marks its
-id cancelled either way; execute_async() then discards results for cancelled ids
-(passing the CANCELLED sentinel to the callback instead) rather than trying to abort
-the in-flight MCP request itself - real MCP cancellation notifications don't reach our
-transport (McpTransport drops every id-less JSON-RPC message), so a real stop can only
-ever come from the paired tool, never from the dispatch layer.
-"""
+from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import concurrent.futures
 import json
 import threading
+from collections.abc import Collection, Mapping
+from typing import Any
 
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from luxai.magpie.utils import Logger
 
-# Sentinel passed to an execute_async() callback instead of real results when every
-# tool_call_id in that batch was cancelled before it finished - see cancel_all().
-CANCELLED = object()
+from .tool_output import ToolCallResult, ToolImage
 
-# A tool ToolEngine offers itself - not sourced from any MCP client, not routed
-# through self._tools at all (see _run_one()). Lets the LLM translate a
-# natural-language "stop/cancel everything" request into cancel_all() directly, with
-# no round-trip and no separate provider/wiring needed anywhere else.
+
+CANCELLED = object()
 CANCEL_ALL_TOOL_NAME = "cancel_all_actions"
-_CANCEL_ALL_SCHEMA = {
+
+_CANCEL_ALL_SCHEMA: dict[str, Any] = {
     "type": "function",
-    "function": {
-        "name": CANCEL_ALL_TOOL_NAME,
-        "description": (
-            "Stop everything currently in progress - any ongoing search, tool call, "
-            "or background action. Call this when the user asks you to cancel, stop, "
-            "or nevermind whatever you're currently doing."
-        ),
-        "parameters": {"type": "object", "properties": {}},
+    "name": CANCEL_ALL_TOOL_NAME,
+    "description": (
+        "Cancel every action currently in progress. Use this when the user "
+        "asks to stop current work."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
     },
 }
 
 
+ToolWhitelist = Mapping[str, str | None] | Collection[str]
+
+
 class ToolEngine:
+    """Merge MCP sources into one flat S2S tool schema and dispatch table."""
 
-    def __init__(self, sources: dict, whitelists: dict = None, retries: int = 1):
-        """
-        sources:    {source_name: fastmcp.Client}, e.g. {"robot": robot_client, "user": user_client}
-        whitelists: optional {source_name: {tool_name: cancel_tool_name | None}} - only
-                    expose these tools from that source; cancel_tool_name, if given, is
-                    dispatched by cancel_all() to request an early, best-effort stop.
-        retries:    extra attempts for transport-level failures (not for tool-reported errors)
-        """
-        self._sources = sources
-        self._whitelists = whitelists or {}
+    def __init__(
+        self,
+        sources: Mapping[str, Client],
+        whitelists: Mapping[str, ToolWhitelist] | None = None,
+        *,
+        retries: int = 0,
+    ) -> None:
+        if retries < 0:
+            raise ValueError("retries cannot be negative")
+        self._sources = dict(sources)
+        self._whitelists: dict[str, dict[str, str | None]] = {}
+        for source, whitelist in (whitelists or {}).items():
+            if isinstance(whitelist, Mapping):
+                self._whitelists[source] = dict(whitelist)
+            else:
+                self._whitelists[source] = {name: None for name in whitelist}
         self._retries = retries
-        self._tools: dict[str, tuple[Client, str, str | None]] = {}   # name -> (client, source_name, cancel_name)
-        self._schemas: list[dict] = []
-        self._loop = None   # resolved by discover() - the loop self._sources' MCP
-                             # clients are bound to; execute_async() dispatches back
-                             # onto this exact loop, never a fresh one, since fastmcp
-                             # Client sessions can't be used from a different loop.
-
-        # In-flight bookkeeping for cancel_all() - tool_call_id -> tool_name, populated
-        # right before dispatch and cleared once that id's batch finishes either way.
+        self._tools: dict[str, tuple[Client, str, str | None]] = {}
+        self._schemas: list[dict[str, Any]] = []
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: dict[str, str] = {}
         self._pending_lock = threading.Lock()
         self._cancelled_ids: set[str] = set()
+        self._cancellation_futures: dict[
+            tuple[int, str], concurrent.futures.Future[None]
+        ] = {}
+        self._cancellation_futures_lock = threading.Lock()
 
     async def discover(self) -> None:
+        """Discover tools and build the flat schemas accepted by S2S."""
         self._loop = asyncio.get_running_loop()
         tools: dict[str, tuple[Client, str, str | None]] = {}
-        schemas: list[dict] = []
+        schemas: list[dict[str, Any]] = []
 
         for source_name, client in self._sources.items():
-            mcp_tools = await client.list_tools()
+            discovered = list(await client.list_tools())
             whitelist = self._whitelists.get(source_name)
-            if whitelist:
-                mcp_tools = [t for t in mcp_tools if t.name in whitelist]
+            if whitelist is not None:
+                available = {tool.name for tool in discovered}
+                missing = sorted(set(whitelist) - available)
+                cancel_names = {name for name in whitelist.values() if name}
+                missing_cancel_tools = sorted(cancel_names - available)
+                if missing:
+                    Logger.warning(
+                        f"ToolEngine: {source_name} is missing tools: {missing}"
+                    )
+                if missing_cancel_tools:
+                    Logger.warning(
+                        f"ToolEngine: {source_name} is missing cancel tools: "
+                        f"{missing_cancel_tools}"
+                    )
+                discovered = [tool for tool in discovered if tool.name in whitelist]
 
-            for tool in mcp_tools:
+            for tool in discovered:
                 if tool.name == CANCEL_ALL_TOOL_NAME:
                     raise ValueError(
-                        f"Tool name collision: '{tool.name}' is reserved by ToolEngine "
-                        f"itself, but '{source_name}' also defines it"
+                        f"Tool name {CANCEL_ALL_TOOL_NAME!r} is reserved by ToolEngine"
                     )
                 if tool.name in tools:
                     other_source = tools[tool.name][1]
                     raise ValueError(
-                        f"Tool name collision: '{tool.name}' is defined by both "
-                        f"'{other_source}' and '{source_name}'"
+                        f"Tool {tool.name!r} is defined by both "
+                        f"{other_source!r} and {source_name!r}"
                     )
-                cancel_name = whitelist.get(tool.name) if whitelist else None
+                cancel_name = whitelist.get(tool.name) if whitelist is not None else None
                 tools[tool.name] = (client, source_name, cancel_name)
-                schemas.append({
-                    "type": "function",
-                    "function": {
+                schemas.append(
+                    {
+                        "type": "function",
                         "name": tool.name,
                         "description": tool.description or tool.name,
-                        "parameters": tool.inputSchema or {"type": "object", "properties": {}},
-                    },
-                })
+                        "parameters": tool.inputSchema
+                        or {"type": "object", "properties": {}},
+                    }
+                )
 
-        # ToolEngine's own built-in tool - not from any source, always offered (see
-        # CANCEL_ALL_TOOL_NAME above). Not added to `tools`: _run_one() special-cases
-        # it before ever consulting self._tools.
-        schemas.append(_CANCEL_ALL_SCHEMA)
-
+        schemas.append(dict(_CANCEL_ALL_SCHEMA))
         self._tools = tools
         self._schemas = schemas
-        Logger.info(f"ToolEngine: discovered {len(tools)} tools: {sorted(tools)}")
+        Logger.info(
+            f"ToolEngine: discovered {len(tools)} MCP tools: {sorted(tools)}"
+        )
 
-    def schemas(self) -> list[dict]:
-        return self._schemas
+    def schemas(self) -> list[dict[str, Any]]:
+        """Return copies of the function schemas for ``session.update``."""
+        return [dict(schema) for schema in self._schemas]
 
-    def print_schemas(self, raw: bool = False) -> None:
-        """Pretty-print every discovered/merged tool schema - name, source, description,
-        parameters - for inspection (e.g. from a '/tools' debug command). raw=True dumps
-        the exact JSON list as sent to the LLM instead."""
-        if raw:
-            print(json.dumps(self._schemas, indent=2))
-            return
+    async def execute(self, tool_calls: Collection[Mapping[str, Any]]) -> list[ToolCallResult]:
+        """Execute independent tool calls concurrently."""
+        return list(
+            await asyncio.gather(*(self._run_one(call) for call in tool_calls))
+        )
 
-        print(f"\n--- tools ({len(self._schemas)}) ---")
-        for schema in self._schemas:
-            fn = schema["function"]
-            source = self._tools[fn["name"]][1]
-            print(f"[{source}] {fn['name']}: {fn['description']}")
-            print(f"    parameters: {json.dumps(fn['parameters'])}")
-        print("--- end tools ---\n")
-
-    async def execute(self, tool_calls: list[dict]) -> list[dict]:
-        """tool_calls: [{'id', 'name', 'arguments'(json str)}, ...], run concurrently.
-        Returns [{'tool_call_id', 'content', 'extra_messages'}, ...] - never raises;
-        failures come back as an error string in 'content' for the LLM to see."""
-        return list(await asyncio.gather(*(self._run_one(tc) for tc in tool_calls)))
-
-    def execute_async(self, tool_calls: list[dict], callback) -> None:
-        """Non-blocking version of execute() - callable from any thread, including one
-        with no event loop of its own (e.g. LLMEngine's worker thread). Lets a caller
-        move on immediately instead of waiting on a slow tool/agent call - this is the
-        one place that owns *how* tool dispatch avoids blocking, so callers never need
-        their own threading for it.
-
-        Dispatches the actual work back onto the loop self._sources' MCP clients were
-        opened on (captured by discover()) via run_coroutine_threadsafe - a fresh loop
-        (e.g. asyncio.run() on a new thread) can't touch those clients at all, they
-        belong to the loop that created them. Once done, callback(results) runs on yet
-        another fresh thread, not the event loop's own thread - callback may itself do
-        blocking work (e.g. a follow-up completion), which would otherwise freeze the
-        whole event loop, MCP transport included.
-
-        Registers every tool_call_id as pending before dispatch and clears it once this
-        batch finishes, so cancel_all() (possibly called from a different thread while
-        this is in flight) knows what it can target. If any id in this batch was
-        cancelled by the time it finishes, callback gets the CANCELLED sentinel instead
-        of real results - the call itself was never force-stopped (only its paired
-        cancel tool, if any, was asked to stop it), this just discards a now-unwanted
-        answer rather than acting on it."""
-        ids = [tc["id"] for tc in tool_calls]
+    async def execute_tracked(
+        self,
+        tool_calls: Collection[Mapping[str, Any]],
+    ) -> list[ToolCallResult] | object:
+        """Execute calls while making them visible to :meth:`cancel_all`."""
+        calls = list(tool_calls)
+        call_ids = [self._call_id(call) for call in calls]
         with self._pending_lock:
-            for tc in tool_calls:
-                self._pending[tc["id"]] = tc["name"]
+            for call, call_id in zip(calls, call_ids):
+                self._pending[call_id] = str(call.get("name") or "")
 
-        future = asyncio.run_coroutine_threadsafe(self.execute(tool_calls), self._loop)
-
-        def _finish(f):
+        try:
+            results = await self.execute(calls)
+        finally:
             with self._pending_lock:
-                cancelled = any(i in self._cancelled_ids for i in ids)
-                for i in ids:
-                    self._pending.pop(i, None)
-                    self._cancelled_ids.discard(i)
-            results = CANCELLED if cancelled else f.result()
-            threading.Thread(target=callback, args=(results,), daemon=True).start()
+                was_cancelled = any(
+                    call_id in self._cancelled_ids for call_id in call_ids
+                )
+                for call_id in call_ids:
+                    self._pending.pop(call_id, None)
+                    self._cancelled_ids.discard(call_id)
 
-        future.add_done_callback(_finish)
+        return CANCELLED if was_cancelled else results
 
     def cancel_all(self) -> set[str]:
-        """Marks every currently in-flight tool call cancelled - execute_async() will
-        discard its result (see CANCELLED) once it finishes, regardless of whether it
-        could actually be stopped early. For calls whose tool has a paired cancel tool
-        (see whitelists), also dispatches that cancel tool as a real, best-effort
-        request to stop early - fire-and-forget, its own result is irrelevant here.
-        Calls without a pairing just keep running to completion in the background;
-        wasted computation, but no different from letting any other unwanted work
-        finish - never force-killed.
-
-        Returns the tool_call_ids just marked cancelled. ToolEngine has no idea
-        anything else (e.g. a WSM "in progress" entry) is tracking these same ids -
-        it just hands them back so a caller like LLMEngine can clean up its own
-        bookkeeping immediately, rather than waiting for the (possibly still-running)
-        call to actually finish."""
+        """Suppress pending results and request paired robot cancellations."""
         with self._pending_lock:
             pending = dict(self._pending)
             self._cancelled_ids.update(pending)
 
-        for tool_call_id, tool_name in pending.items():
-            client, _, cancel_name = self._tools.get(tool_name, (None, None, None))
-            if client is not None and cancel_name is not None:
-                asyncio.run_coroutine_threadsafe(self._dispatch_cancel(client, cancel_name), self._loop)
+        loop = self._loop
+        if loop is None:
+            return set(pending)
+
+        dispatched: set[tuple[int, str]] = set()
+        for tool_name in pending.values():
+            client, _source, cancel_name = self._tools.get(
+                tool_name,
+                (None, "", None),
+            )
+            if client is None or cancel_name is None:
+                continue
+            dispatch_key = (id(client), cancel_name)
+            if dispatch_key in dispatched:
+                continue
+            dispatched.add(dispatch_key)
+            with self._cancellation_futures_lock:
+                existing = self._cancellation_futures.get(dispatch_key)
+                if existing is not None and not existing.done():
+                    continue
+                future = asyncio.run_coroutine_threadsafe(
+                    self._dispatch_cancel(client, cancel_name),
+                    loop,
+                )
+                self._cancellation_futures[dispatch_key] = future
+            # Register outside the lock: add_done_callback() may invoke the
+            # callback immediately when a very fast cancel has already ended.
+            future.add_done_callback(
+                lambda completed, key=dispatch_key: (
+                    self._forget_cancellation(key, completed)
+                )
+            )
 
         return set(pending)
+
+    async def wait_for_cancellations(self) -> None:
+        """Wait until all paired cancel calls scheduled so far have finished.
+
+        This must complete before the owning MCP clients are closed. Calls are
+        normally made from the same event loop on which :meth:`discover` ran;
+        cross-loop callers are forwarded to that owning loop.
+        """
+        owner_loop = self._loop
+        if owner_loop is None:
+            return
+        running_loop = asyncio.get_running_loop()
+        if running_loop is not owner_loop:
+            forwarded = asyncio.run_coroutine_threadsafe(
+                self.wait_for_cancellations(),
+                owner_loop,
+            )
+            await asyncio.wrap_future(forwarded)
+            return
+
+        while True:
+            with self._cancellation_futures_lock:
+                futures = tuple(self._cancellation_futures.values())
+            if not futures:
+                return
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in futures),
+                return_exceptions=True,
+            )
+
+    def _forget_cancellation(
+        self,
+        key: tuple[int, str],
+        completed: concurrent.futures.Future[None],
+    ) -> None:
+        with self._cancellation_futures_lock:
+            if self._cancellation_futures.get(key) is completed:
+                self._cancellation_futures.pop(key, None)
 
     async def _dispatch_cancel(self, client: Client, cancel_name: str) -> None:
         try:
             await client.call_tool(cancel_name, {})
-        except Exception as e:
-            Logger.debug(f"ToolEngine: cancel tool '{cancel_name}' failed: {e}")
+        except Exception as exc:
+            Logger.warning(
+                f"ToolEngine: cancel tool {cancel_name!r} failed: {exc}"
+            )
 
-    async def _run_one(self, tc: dict) -> dict:
-        tool_call_id = tc["id"]
-        name = tc["name"]
+    async def _run_one(self, call: Mapping[str, Any]) -> ToolCallResult:
+        call_id = self._call_id(call)
+        name = str(call.get("name") or "")
 
         if name == CANCEL_ALL_TOOL_NAME:
-            # Handled entirely in-process, no MCP call. Exclude this call's own id
-            # from _pending BEFORE calling cancel_all(), or it would mark itself
-            # cancelled too - execute_async()'s callback would then discard this very
-            # confirmation as CANCELLED, even though it's the one thing that must NOT
-            # be discarded.
+            # The control call must not cancel its own confirmation result.
             with self._pending_lock:
-                self._pending.pop(tool_call_id, None)
-            self.cancel_all()
-            return {"tool_call_id": tool_call_id, "content": "Cancelled everything currently in progress.",
-                    "extra_messages": []}
+                self._pending.pop(call_id, None)
+            cancelled_ids = self.cancel_all()
+            if cancelled_ids:
+                output = "Cancellation requested for all actions currently in progress."
+            else:
+                output = "No actions are currently in progress."
+            return {"tool_call_id": call_id, "output": output, "images": []}
 
         if name not in self._tools:
-            return self._error_result(tool_call_id, f"tool '{name}' does not exist")
+            return self._error_result(call_id, f"tool {name!r} does not exist")
 
-        try:
-            args = json.loads(tc.get("arguments") or "{}")
-        except json.JSONDecodeError as e:
-            return self._error_result(tool_call_id, f"invalid arguments JSON: {e}")
+        raw_arguments = call.get("arguments") or {}
+        if isinstance(raw_arguments, str):
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as exc:
+                return self._error_result(call_id, f"invalid arguments JSON: {exc}")
+        else:
+            arguments = raw_arguments
+        if not isinstance(arguments, Mapping):
+            return self._error_result(call_id, "arguments must be a JSON object")
 
-        client, _, _ = self._tools[name]
-
-        last_error = None
+        client, _source, _cancel_name = self._tools[name]
+        last_error: Exception | None = None
         for attempt in range(self._retries + 1):
             try:
-                result = await client.call_tool(name, args)
-                return self._to_result(tool_call_id, result)
-            except ToolError as e:
-                # A real, reported tool failure (e.g. bad gesture name) - not transient, don't retry.
-                return self._error_result(tool_call_id, str(e))
-            except Exception as e:
-                last_error = e
-                Logger.debug(f"ToolEngine: '{name}' attempt {attempt + 1} failed: {e}")
-
-        return self._error_result(tool_call_id, f"call failed after {self._retries + 1} attempts: {last_error}")
-
-    def _to_result(self, tool_call_id: str, result) -> dict:
-        text_parts = []
-        extra_messages = []
-        for block in result.content:
-            if block.type == "text":
-                image = self._extract_image_envelope(block.text)
-                if image:
-                    extra_messages.append(self._image_message(image["mimeType"], image["data"]))
-                else:
-                    text_parts.append(block.text)
-            elif block.type == "image":
-                # Native MCP image content block. McpSchema-based tools can't produce this
-                # today (see _extract_image_envelope), but other MCP sources might.
-                extra_messages.append(self._image_message(block.mimeType, block.data))
+                result = await client.call_tool(name, dict(arguments))
+            except ToolError as exc:
+                return self._error_result(call_id, str(exc))
+            except Exception as exc:
+                last_error = exc
+                Logger.debug(
+                    f"ToolEngine: {name!r} attempt {attempt + 1} failed: {exc}"
+                )
             else:
-                text_parts.append(str(block))
+                # A completed remote call is never repeated just because its
+                # returned content is malformed.
+                try:
+                    return self._normalize_result(call_id, result)
+                except Exception as exc:
+                    return self._error_result(call_id, f"invalid tool result: {exc}")
 
-        content = "\n".join(text_parts) if text_parts else ("Image captured." if extra_messages else "Done.")
-        return {"tool_call_id": tool_call_id, "content": content, "extra_messages": extra_messages}
+        return self._error_result(
+            call_id,
+            f"call failed after {self._retries + 1} attempt(s): {last_error}",
+        )
 
-    @staticmethod
-    def _extract_image_envelope(text: str):
-        """McpSchema always wraps tool results as a text block (see mcp_schema.py's
-        _mcp_tools_call), so a tool like get_image() can't return a native MCP image
-        content block - it JSON-serializes a {'mimeType', 'data'} dict into text instead.
-        Detect that shape here and treat it as an image rather than literal text."""
-        try:
-            obj = json.loads(text)
-        except (json.JSONDecodeError, TypeError):
+    def _normalize_result(self, call_id: str, result: Any) -> ToolCallResult:
+        text_parts: list[str] = []
+        images: list[ToolImage] = []
+        seen_images: set[tuple[str, str]] = set()
+
+        def add_image(mime_type: Any, data: Any) -> None:
+            validated = self._validate_image_payload(mime_type, data)
+            key = (validated["mime_type"], validated["data"])
+            if key not in seen_images:
+                seen_images.add(key)
+                images.append(validated)
+
+        for block in getattr(result, "content", ()) or ():
+            block_type = getattr(block, "type", "unknown")
+            if block_type == "text":
+                image = self._extract_image_envelope(getattr(block, "text", ""))
+                if image is None:
+                    text_parts.append(str(getattr(block, "text", "")))
+                else:
+                    add_image(*image)
+            elif block_type == "image":
+                add_image(
+                    getattr(block, "mimeType", None),
+                    getattr(block, "data", None),
+                )
+            else:
+                text_parts.append(f"Unsupported MCP content type: {block_type}.")
+
+        structured = getattr(result, "structured_content", None)
+        if structured is None:
+            structured = getattr(result, "structuredContent", None)
+        if structured is not None:
+            image = self._extract_image_envelope(structured)
+            if image is not None:
+                add_image(*image)
+            elif not text_parts:
+                text_parts.append(
+                    json.dumps(structured, separators=(",", ":"), ensure_ascii=False)
+                )
+
+        text = "\n".join(part for part in text_parts if part)
+        if not text:
+            text = "Image captured." if images else "Done."
+        return {"tool_call_id": call_id, "output": text, "images": images}
+
+    @classmethod
+    def _extract_image_envelope(cls, value: Any) -> tuple[str, str] | None:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        if not isinstance(value, Mapping):
             return None
-        if isinstance(obj, dict) and "data" in obj and "mimeType" in obj:
-            return obj
-        return None
+        if "mimeType" not in value or "data" not in value:
+            return None
+        image = cls._validate_image_payload(value.get("mimeType"), value.get("data"))
+        return image["mime_type"], image["data"]
 
     @staticmethod
-    def _image_message(mime_type: str, data: str) -> dict:
-        return {
-            "role": "user",
-            "content": [{
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{data}"},
-            }],
-        }
+    def _validate_image_payload(mime_type: Any, data: Any) -> ToolImage:
+        if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+            raise ValueError("MCP image content has an invalid MIME type")
+        if not isinstance(data, str) or not data:
+            raise ValueError("MCP image content has no base64 data")
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("MCP image content contains invalid base64 data") from exc
+        if not decoded:
+            raise ValueError("MCP image content decoded to an empty image")
+        return {"mime_type": mime_type, "data": data}
 
-    def _error_result(self, tool_call_id: str, message: str) -> dict:
-        return {"tool_call_id": tool_call_id, "content": f"Error: {message}", "extra_messages": []}
+    @staticmethod
+    def _error_result(call_id: str, message: str) -> ToolCallResult:
+        return {"tool_call_id": call_id, "output": f"Error: {message}", "images": []}
+
+    @staticmethod
+    def _call_id(call: Mapping[str, Any]) -> str:
+        call_id = str(call.get("call_id") or call.get("id") or "")
+        if not call_id:
+            raise ValueError("tool call has no call_id")
+        return call_id
