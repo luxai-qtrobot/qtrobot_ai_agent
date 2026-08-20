@@ -40,7 +40,141 @@ The coordinator safely injects the completed result into the conversation. Remin
 
 ## Add an isolated agent
 
-Use `src/agents/web_search/` as the reference. The main assistant sees one simple public tool, while the specialized agent has its own instructions, private tools, bounded tool loop, lifecycle, and background completion event. This keeps the main tool surface small and makes each agent independently testable.
+An isolated agent gives one focused task to a separate model loop with its own instructions and private tools. The main assistant sees only one public tool, while the internal tools stay hidden.
+
+The following example creates a small product-advisor agent.
+
+### 1. Create the private tool
+
+Create `src/agents/product_advisor/tools.py`:
+
+```python
+from luxai.magpie.schema import McpSchema
+
+from tool.tool_base import ToolBase
+
+
+PRODUCTS = {
+    "research": "QTrobot Research supports Python, ROS, and C++ development.",
+    "education": "QTrobot Education includes visual teaching tools and curricula.",
+}
+
+
+class ProductTools(ToolBase):
+    def register(self, schema: McpSchema) -> None:
+        schema.method()(self.lookup_product)
+
+    def lookup_product(self, product: str) -> str:
+        """Look up verified information about a QTrobot product."""
+        return PRODUCTS.get(product.lower(), "No matching product was found.")
+```
+
+This tool is available only to the product-advisor agent.
+
+### 2. Write focused instructions
+
+Create `src/agents/product_advisor/instructions.txt`:
+
+```text
+You are a QTrobot product advisor.
+Use lookup_product before answering product questions.
+Give a concise answer based only on the retrieved information.
+If no information is found, say so instead of guessing.
+```
+
+### 3. Expose one public agent tool
+
+Create `src/agents/product_advisor/agent.py`:
+
+```python
+import asyncio
+import concurrent.futures
+import threading
+from pathlib import Path
+
+from luxai.magpie.schema import McpSchema
+
+from ..agent_base import AGENT_TOOLS_ENDPOINT, AgentBase
+
+
+INSTRUCTIONS = Path(__file__).with_name("instructions.txt")
+
+
+class ProductAdvisorAgent(AgentBase):
+    def __init__(self, client, model, *, owner_loop, endpoint=AGENT_TOOLS_ENDPOINT):
+        super().__init__(
+            client,
+            model,
+            {"lookup_product": None},
+            INSTRUCTIONS.read_text(encoding="utf-8"),
+            endpoint=endpoint,
+        )
+        self._owner_loop = owner_loop
+        self._jobs = set()
+        self._jobs_lock = threading.Lock()
+        self._closed = False
+
+    def register(self, schema: McpSchema) -> None:
+        schema.method()(self.ask_product_advisor)
+
+    def ask_product_advisor(self, question: str) -> str:
+        """Answer a question using the QTrobot product advisor."""
+        question = question.strip()
+        if not question:
+            raise ValueError("Question cannot be empty")
+
+        with self._jobs_lock:
+            if self._closed:
+                raise RuntimeError("Product advisor is shutting down")
+            future = asyncio.run_coroutine_threadsafe(
+                self.run(question), self._owner_loop
+            )
+            self._jobs.add(future)
+
+        try:
+            return future.result(timeout=120)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise RuntimeError("Product advisor timed out") from exc
+        finally:
+            with self._jobs_lock:
+                self._jobs.discard(future)
+
+    async def close(self) -> None:
+        with self._jobs_lock:
+            self._closed = True
+            jobs = tuple(self._jobs)
+        for job in jobs:
+            job.cancel()
+        if jobs:
+            await asyncio.gather(
+                *(asyncio.wrap_future(job) for job in jobs),
+                return_exceptions=True,
+            )
+
+    def cleanup(self) -> None:
+        with self._jobs_lock:
+            self._closed = True
+            jobs = tuple(self._jobs)
+        for job in jobs:
+            job.cancel()
+```
+
+The main assistant sees only `ask_product_advisor`. The agent itself can discover and call `lookup_product`, repeat tool calls when needed, and synthesize the final answer.
+
+### 4. Register the agent
+
+In `src/agents/agent_registry.py`:
+
+1. Add `ProductTools()` to the private providers passed to `LocalToolServer`.
+2. Create `ProductAdvisorAgent(client, model, owner_loop=owner_loop)` and append it to `_agents`.
+3. Keep optional agents independent: a missing Tavily key may disable web search, but it should not return before the product advisor is registered.
+4. Export the new classes from `src/agents/product_advisor/__init__.py`.
+5. In `src/main.py`, construct `AgentRegistry` whenever the product advisor is enabled, rather than only when `web_search.enabled` is true.
+
+Add the new provider alongside the existing web-search provider; both agents can share the same private MCP server and endpoint. `AgentRegistry.as_tools()` then exposes the product advisor automatically to the main application.
+
+This example is intentionally a normal foreground agent: the conversation waits for its answer. For work that may take a long time, use the background-event pattern and the complete lifecycle in `src/agents/web_search/` as the reference.
 
 ## Reuse the S2S client
 
