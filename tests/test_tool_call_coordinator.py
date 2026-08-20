@@ -12,7 +12,7 @@ SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from tool_call_coordinator import ToolCallCoordinator
+from s2s import ToolCallCoordinator
 
 
 class _Client:

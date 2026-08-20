@@ -13,12 +13,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from main import (
-    BACKGROUND_EVENT_INSTRUCTIONS,
-    DEFAULT_ASSISTANT_INSTRUCTIONS,
-    MEMORY_TOOL_INSTRUCTIONS,
     _log_event,
     _session_config,
 )
+from s2s._internal_instructions import (
+    BACKGROUND_EVENT_INSTRUCTIONS,
+    WEB_SEARCH_INSTRUCTIONS,
+)
+from tool import MEMORY_TOOL_INSTRUCTIONS
 
 
 class _Memory:
@@ -30,11 +32,19 @@ class _Memory:
 
 
 class MainSessionConfigTests(unittest.TestCase):
-    def test_default_instructions_include_background_event_contract(self) -> None:
-        session = _session_config("Aiden", None, [])
+    def test_configured_instructions_include_internal_contracts(self) -> None:
+        session = _session_config(
+            "Aiden",
+            "Be friendly.",
+            [],
+            web_search_enabled=True,
+            memory_enabled=True,
+            documents_enabled=True,
+        )
 
-        self.assertIn(DEFAULT_ASSISTANT_INSTRUCTIONS, session["instructions"])
+        self.assertIn("Be friendly.", session["instructions"])
         self.assertIn(BACKGROUND_EVENT_INSTRUCTIONS, session["instructions"])
+        self.assertIn(WEB_SEARCH_INSTRUCTIONS, session["instructions"])
         self.assertIn(MEMORY_TOOL_INSTRUCTIONS, session["instructions"])
         self.assertIn("reminder.due", session["instructions"])
         self.assertIn("search_web", session["instructions"])
@@ -44,11 +54,13 @@ class MainSessionConfigTests(unittest.TestCase):
 
         self.assertTrue(session["instructions"].startswith("Be playful."))
         self.assertIn(BACKGROUND_EVENT_INSTRUCTIONS, session["instructions"])
+        self.assertNotIn(WEB_SEARCH_INSTRUCTIONS, session["instructions"])
+        self.assertNotIn(MEMORY_TOOL_INSTRUCTIONS, session["instructions"])
 
     def test_document_inventory_is_added_to_session_instructions(self) -> None:
         inventory = "[Documents loaded and searchable via search_documents()]:\n- QTrobot manual"
 
-        session = _session_config("Aiden", None, [], inventory)
+        session = _session_config("Aiden", "Use documents.", [], inventory)
 
         self.assertIn(inventory, session["instructions"])
         self.assertEqual(session["instructions"].count(inventory), 1)

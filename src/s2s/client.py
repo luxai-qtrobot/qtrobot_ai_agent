@@ -22,11 +22,6 @@ from luxai.magpie.utils import Logger
 from luxai.magpie.utils.common import get_uinque_id
 
 
-AUDIO_INPUT_TOPIC = "/s2s/audio/input"
-AUDIO_OUTPUT_TOPIC = "/s2s/audio/output"
-EVENT_INPUT_TOPIC = "/s2s/events/input"
-EVENT_OUTPUT_TOPIC = "/s2s/events/output"
-
 CLIENT_AUDIO_READER_QUEUE_SIZE = 256
 CLIENT_EVENT_READER_QUEUE_SIZE = 4096
 CLIENT_INPUT_WRITER_QUEUE_SIZE = 0
@@ -188,23 +183,22 @@ def _parse_stream_route(topic: object, value: object, default_host: str) -> _Zmq
 def _select_route(
     routes: list[_ZmqStreamRoute],
     *,
-    topic: str,
     direction: str,
     frame_type: str,
 ) -> _ZmqStreamRoute:
-    matches = [route for route in routes if route.topic == topic]
+    matches = [
+        route
+        for route in routes
+        if route.direction == direction and route.frame_type == frame_type
+    ]
     if len(matches) != 1:
+        matched_topics = [route.topic for route in matches]
         raise ValueError(
-            f"Expected exactly one {topic!r} stream in the S2S descriptor; "
-            f"found {len(matches)}"
+            f"Expected exactly one S2S stream with direction={direction!r} "
+            f"and frame_type={frame_type!r}; found {len(matches)} "
+            f"({matched_topics})"
         )
-    route = matches[0]
-    if route.direction != direction or route.frame_type != frame_type:
-        raise ValueError(
-            f"S2S stream {topic!r} must be {direction!r} {frame_type}, got "
-            f"{route.direction!r} {route.frame_type}"
-        )
-    return route
+    return matches[0]
 
 
 def _discover_streams(
@@ -228,16 +222,16 @@ def _discover_streams(
         rpc_endpoint=rpc_endpoint,
         node_id=str(descriptor.get("node_id")) if descriptor.get("node_id") else None,
         audio_input=_select_route(
-            parsed, topic=AUDIO_INPUT_TOPIC, direction="in", frame_type="AudioFrameRaw"
+            parsed, direction="in", frame_type="AudioFrameRaw"
         ),
         audio_output=_select_route(
-            parsed, topic=AUDIO_OUTPUT_TOPIC, direction="out", frame_type="S2SAudioFrame"
+            parsed, direction="out", frame_type="S2SAudioFrame"
         ),
         event_input=_select_route(
-            parsed, topic=EVENT_INPUT_TOPIC, direction="in", frame_type="DictFrame"
+            parsed, direction="in", frame_type="DictFrame"
         ),
         event_output=_select_route(
-            parsed, topic=EVENT_OUTPUT_TOPIC, direction="out", frame_type="DictFrame"
+            parsed, direction="out", frame_type="DictFrame"
         ),
     )
     Logger.info(

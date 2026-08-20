@@ -4,6 +4,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -11,8 +12,14 @@ SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-import s2s_client as module
+import s2s.client as module
 from luxai.magpie.frames import AudioFrameRaw, DictFrame
+
+
+AUDIO_INPUT_TOPIC = "/custom/audio/input"
+AUDIO_OUTPUT_TOPIC = "/custom/audio/output"
+EVENT_INPUT_TOPIC = "/custom/events/input"
+EVENT_OUTPUT_TOPIC = "/custom/events/output"
 
 
 class _Writer:
@@ -30,7 +37,7 @@ class _Reader:
     def read(self, timeout: float):
         if not self.frames:
             raise TimeoutError
-        return self.frames.pop(0), module.AUDIO_OUTPUT_TOPIC
+        return self.frames.pop(0), AUDIO_OUTPUT_TOPIC
 
 
 def _routes() -> module._S2SStreamRoutes:
@@ -47,10 +54,10 @@ def _routes() -> module._S2SStreamRoutes:
     return module._S2SStreamRoutes(
         rpc_endpoint="tcp://127.0.0.1:1",
         node_id="test-s2s",
-        audio_input=route(module.AUDIO_INPUT_TOPIC, "in", "AudioFrameRaw"),
-        audio_output=route(module.AUDIO_OUTPUT_TOPIC, "out", "S2SAudioFrame"),
-        event_input=route(module.EVENT_INPUT_TOPIC, "in", "DictFrame"),
-        event_output=route(module.EVENT_OUTPUT_TOPIC, "out", "DictFrame"),
+        audio_input=route(AUDIO_INPUT_TOPIC, "in", "AudioFrameRaw"),
+        audio_output=route(AUDIO_OUTPUT_TOPIC, "out", "S2SAudioFrame"),
+        event_input=route(EVENT_INPUT_TOPIC, "in", "DictFrame"),
+        event_output=route(EVENT_OUTPUT_TOPIC, "out", "DictFrame"),
     )
 
 
@@ -79,6 +86,44 @@ class S2SClientValidationTests(unittest.TestCase):
             "tcp://192.168.3.10:50961",
         )
 
+    def test_discovers_topics_from_stream_metadata(self) -> None:
+        descriptor = {
+            "node_id": "test-s2s",
+            "stream": {
+                AUDIO_INPUT_TOPIC: {
+                    "direction": "in",
+                    "frame_type": "AudioFrameRaw",
+                    "transports": {"zmq": {"endpoint": "tcp://*:1"}},
+                },
+                AUDIO_OUTPUT_TOPIC: {
+                    "direction": "out",
+                    "frame_type": "S2SAudioFrame",
+                    "transports": {"zmq": {"endpoint": "tcp://*:2"}},
+                },
+                EVENT_INPUT_TOPIC: {
+                    "direction": "in",
+                    "frame_type": "DictFrame",
+                    "transports": {"zmq": {"endpoint": "tcp://*:3"}},
+                },
+                EVENT_OUTPUT_TOPIC: {
+                    "direction": "out",
+                    "frame_type": "DictFrame",
+                    "transports": {"zmq": {"endpoint": "tcp://*:4"}},
+                },
+            },
+        }
+        with patch.object(module, "_read_system_descriptor", return_value=descriptor):
+            routes = module._discover_streams(
+                endpoint="tcp://192.168.3.10:50960",
+                node_id=None,
+                timeout=1.0,
+            )
+
+        self.assertEqual(routes.audio_input.topic, AUDIO_INPUT_TOPIC)
+        self.assertEqual(routes.audio_output.topic, AUDIO_OUTPUT_TOPIC)
+        self.assertEqual(routes.event_input.topic, EVENT_INPUT_TOPIC)
+        self.assertEqual(routes.event_output.topic, EVENT_OUTPUT_TOPIC)
+
 
 class S2SClientAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_audio_reenvelopes_without_mutating_source(self) -> None:
@@ -100,7 +145,7 @@ class S2SClientAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.id, 42)
         self.assertEqual(len(writer.writes), 1)
         payload, topic = writer.writes[0]
-        self.assertEqual(topic, module.AUDIO_INPUT_TOPIC)
+        self.assertEqual(topic, AUDIO_INPUT_TOPIC)
         self.assertEqual(payload["gid"], "session-1")
         self.assertEqual(payload["id"], 1)
         self.assertEqual(payload["data"], b"\x01\x02")
@@ -124,7 +169,7 @@ class S2SClientAsyncTests(unittest.IsolatedAsyncioTestCase):
         await ack
 
         sent, topic = writer.writes[0]
-        self.assertEqual(topic, module.EVENT_INPUT_TOPIC)
+        self.assertEqual(topic, EVENT_INPUT_TOPIC)
         self.assertEqual(sent["value"]["type"], "session.update")
 
         events = client.receive_events()

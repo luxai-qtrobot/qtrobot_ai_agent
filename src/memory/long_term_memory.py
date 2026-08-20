@@ -40,13 +40,15 @@ class LongTermMemory:
 
     def __init__(
         self,
-        chat_history_path: str | Path,
+        chat_history_path: str | Path | None,
         model_name: str = DEFAULT_MODEL,
         rerank_model: str = DEFAULT_RERANK_MODEL,
         chunk_chars: int = 1000,
         chunk_overlap: int = 100,
     ) -> None:
-        self.chat_history_path = Path(chat_history_path)
+        self.chat_history_path = (
+            Path(chat_history_path) if chat_history_path is not None else None
+        )
         self._embedder = TextEmbedding(model_name=model_name)
         self._reranker = TextCrossEncoder(model_name=rerank_model)
         self.chunk_chars = chunk_chars
@@ -160,7 +162,7 @@ class LongTermMemory:
         ]
 
     def _load_chat_history(self) -> None:
-        if not self.chat_history_path.exists():
+        if self.chat_history_path is None or not self.chat_history_path.exists():
             return
 
         records: list[_Record] = []
@@ -246,6 +248,8 @@ class LongTermMemory:
         )
 
     def _append_chat_record(self, record: _Record) -> None:
+        if self.chat_history_path is None:
+            return
         item = {
             "role": record.meta["role"],
             "text": record.text,
