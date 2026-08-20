@@ -2,143 +2,153 @@ name: QTrobot AI Agent
 description: Configuration for the QTrobot AI agent demo
 
 parameters:
-  - name: log_level
+- name: log_level
+  type: string
+  value: INFO
+  description: Application log level
+  scope: cli
+
+- name: robot
+  type: group
+  description: QTrobot connection and audio settings
+  parameters:
+  - name: endpoint
     type: string
-    value: INFO
-    description: Application log level
+    value: tcp://192.168.3.109:50500
+    description: QTrobot RPC endpoint
     scope: cli
 
-  - name: robot
-    type: group
-    description: QTrobot connection and audio settings
-    parameters:
-      - name: endpoint
-        type: string
-        value: tcp://192.168.3.109:50500
-        description: QTrobot RPC endpoint
-        scope: cli
+  - name: volume
+    type: int
+    value: 79
+    description: Speaker volume from 0 to 100
+    scope: all
+    label: Speaker volume
+    ui:
+      element: "slider"
+      min: 0
+      max: 100
 
-      - name: volume
-        type: double
-        value: 0.85
-        description: Speaker volume from 0 to 1
-        scope: all
+  - name: pitch_semitones
+    type: double
+    value: 1.0
+    description: Foreground audio pitch shift
+    scope: cli
 
-      - name: pitch_semitones
-        type: double
-        value: 1.0
-        description: Foreground audio pitch shift
-        scope: all
+- name: camera
+  type: group
+  description: QTrobot camera settings
+  parameters:
+  - name: endpoint
+    type: string
+    value: tcp://192.168.3.109:50750
+    description: Camera service endpoint
+    scope: cli
 
-  - name: camera
-    type: group
-    description: QTrobot camera settings
-    parameters:
-      - name: endpoint
-        type: string
-        value: tcp://192.168.3.109:50750
-        description: Camera service endpoint
-        scope: cli
+- name: human_attention
+  type: group
+  description: Human attention behavior
+  parameters:
+  - name: enabled
+    type: bool
+    value: true
+    description: Enable human tracking
+    scope: cli
 
-  - name: human_attention
-    type: group
-    description: Human attention behavior
-    parameters:
-      - name: enabled
-        type: bool
-        value: true
-        description: Enable human tracking
-        scope: cli
+  - name: detector_endpoint
+    type: string
+    value: tcp://192.168.3.109:50770
+    description: Human detector endpoint
+    scope: cli
 
-      - name: detector_endpoint
-        type: string
-        value: tcp://192.168.3.109:50770
-        description: Human detector endpoint
-        scope: cli
+- name: s2s
+  type: group
+  description: magpie Speech-to-speech service settings
+  parameters:
+  - name: endpoint
+    type: string
+    value: tcp://192.168.3.109:50960
+    description: S2S service endpoint
+    scope: cli
 
-  - name: s2s
-    type: group
-    description: magpie Speech-to-speech service settings
-    parameters:
-      - name: endpoint
-        type: string
-        value: tcp://192.168.3.109:50960
-        description: S2S service endpoint
-        scope: runtime
+  - name: voice
+    type: str
+    value: Aiden
+    description: Default synthesized voice
+    scope: all
+    label: Voice
+    ui:
+      element: "select"
+      items: ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna",
+        "Sohee"]
 
-      - name: voice
-        type: string
-        value: Ono_Anna
-        description: Default synthesized voice
-        scope: all
-        ui:
-          element: "select"
-          items: ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"]
+- name: web_search
+  type: group
+  description: Web search settings
+  parameters:
+  - name: enabled
+    type: bool
+    value: false
+    description: Enable web search
+    scope: cli
 
-  - name: web_search
-    type: group
-    description: Web search settings
-    parameters:
-      - name: enabled
-        type: bool
-        value: false
-        description: Enable web search
-        scope: cli
+  - name: api_key
+    type: string
+    value: ""
+    description: Tavily API key
+    scope: cli
 
-      - name: api_key
-        type: string
-        value: ""
-        description: Tavily API key
-        scope: runtime
+- name: assistant
+  type: group
+  description: Assistant behavior
+  parameters:
+  - name: instructions
+    type: str
+    value: |
+      You are QTrobot, a friendly, physically embodied social robot for kids.
+      You can speak English, French, German, Italian, Portuguese, Russian, and Spanish.
+    description: Assistant system instructions
+    scope: runtime
+    label: Assistant instructions
+    ui:
+      element: textarea
 
-  - name: assistant
-    type: group
-    description: Assistant behavior
-    parameters:
-      - name: instructions
-        type: string
-        value: |
-          You are QTrobot, a friendly, physically embodied social robot for kids.
-          You can speak English, French, German, Italian, Portuguese, Russian, and Spanish.
-        description: Assistant system instructions
-        scope: runtime
+- name: documents
+  type: group
+  description: Document search settings
+  parameters:
+  - name: enabled
+    type: bool
+    value: true
+    description: Enable document search
+    scope: cli
 
-  - name: documents
-    type: group
-    description: Document search settings
-    parameters:
-      - name: enabled
-        type: bool
-        value: true
-        description: Enable document search
-        scope: cli
+  - name: directory
+    type: string
+    value: documents
+    description: Relative or absolute document path
+    scope: cli
 
-      - name: directory
-        type: string
-        value: documents
-        description: Relative or absolute document path
-        scope: runtime
+  - name: summary
+    type: string
+    value: |
+      QTrobot product and hardware overview for Research, School, and Home variants,
+      SDK and Studio programming options, and published QTrobot research papers.
+    description: Overview of indexed documents
+    scope: cli
 
-      - name: summary
-        type: string
-        value: |
-          QTrobot product and hardware overview for Research, School, and Home variants,
-          SDK and Studio programming options, and published QTrobot research papers.
-        description: Overview of indexed documents
-        scope: runtime
+- name: memory
+  type: group
+  description: Long-term memory settings
+  parameters:
+  - name: enabled
+    type: bool
+    value: false
+    description: Enable long-term memory
+    scope: cli
 
-  - name: memory
-    type: group
-    description: Long-term memory settings
-    parameters:
-      - name: enabled
-        type: bool
-        value: false
-        description: Enable long-term memory
-        scope: cli
-
-      - name: history_path
-        type: string
-        value: data/long_term_chat_history.jsonl
-        description: Relative or absolute history file path
-        scope: runtime
+  - name: history_path
+    type: string
+    value: data/long_term_chat_history.jsonl
+    description: Relative or absolute history file path
+    scope: cli

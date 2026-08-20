@@ -23,3 +23,9 @@ WEB_SEARCH_INSTRUCTIONS = """## Web search
 For questions that require current information from the internet, call
 search_web. It starts a background search; do not answer the search question
 from memory or claim completion before the matching background event arrives."""
+
+CAMERA_INSTRUCTIONS = """## Camera perception
+
+For any question requiring QTrobot's current view, MUST call get_image before
+answering. Describe only relevant visible details; if unclear or not visible,
+say so instead of guessing."""

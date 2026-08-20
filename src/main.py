@@ -8,7 +8,6 @@ import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
 from fastmcp import Client
 from luxai.magpie.adapters.mcp import McpTransport
@@ -17,15 +16,16 @@ from luxai.magpie.transport import ZMQRpcRequester
 from luxai.magpie.utils import Logger
 from luxai.robot.core import Robot
 from openai import AsyncOpenAI
-from paramify import Paramify
 
 from agents import AgentRegistry
+from app_config import AppConfig
 from behaviors import HumanAttentionBehavior
 from memory import DirectoryReader, LongTermMemory
 from qtrobot_audio import RobotMicSource, RobotSpeakerSink
 from s2s import S2SClient, ToolCallCoordinator
 from s2s._internal_instructions import (
     BACKGROUND_EVENT_INSTRUCTIONS,
+    CAMERA_INSTRUCTIONS,
     WEB_SEARCH_INSTRUCTIONS,
 )
 from tool import (
@@ -45,6 +45,7 @@ MCP_CALL_TIMEOUT_SECONDS       = 120.0
 DEFAULT_AGENT_LLM_BASE_URL     = "http://192.168.3.109:8080/v1"
 DEFAULT_AGENT_LLM_MODEL        = "gemma-4-12b-it-Q8_0.gguf"
 AGENT_LLM_TIMEOUT_SECONDS      = 60.0
+RUNTIME_SETTING_TIMEOUT_SECONDS = 15.0
 
 # Keep the initial robot surface deliberately small. Local get_datetime and
 # get_image are discovered independently through LocalToolServer.
@@ -82,6 +83,7 @@ def _session_config(
     instruction_sections = [
         base_instructions,
         BACKGROUND_EVENT_INSTRUCTIONS,
+        CAMERA_INSTRUCTIONS,
     ]
     if web_search_enabled:
         instruction_sections.append(WEB_SEARCH_INSTRUCTIONS)
@@ -93,6 +95,7 @@ def _session_config(
         instruction_sections.append(retrieval_instructions)
     if document_index:
         instruction_sections.append(document_index)
+    Logger.warning(instruction_sections)
     session = {
         "type": "realtime",
         "instructions": "\n\n".join(instruction_sections),
@@ -197,7 +200,8 @@ async def _send_background_events(events: asyncio.Queue[dict], tool_calls: ToolC
 
 
 async def _run_conversation(
-    parameters: Any,
+    config: AppConfig,
+    robot: Robot,
     microphone: RobotMicSource,
     speaker: RobotSpeakerSink,
     tool_engine: ToolEngine,
@@ -208,10 +212,36 @@ async def _run_conversation(
     memory_enabled: bool,
     documents_enabled: bool,
 ) -> None:
+    parameters = config.parameters
     tasks: set[asyncio.Task[None]] = set()
 
     async with S2SClient(endpoint=str(parameters.s2s.endpoint)) as client:
         tool_calls = ToolCallCoordinator(client, tool_engine)
+        loop = asyncio.get_running_loop()
+
+        def apply_setting(name: str, value: object) -> None:
+            if name == "volume":
+                robot.speaker.set_volume(float(value) / 100.0)
+                return
+            if name not in {"voice", "instructions"}:
+                raise ValueError(f"Unsupported live setting: {name}")
+
+            future = asyncio.run_coroutine_threadsafe(
+                client.update_session(
+                    _session_config(
+                        str(parameters.s2s.voice),
+                        str(parameters.assistant.instructions),
+                        tool_engine.schemas(),
+                        document_index,
+                        web_search_enabled=web_search_available,
+                        memory_enabled=memory_enabled,
+                        documents_enabled=documents_enabled,
+                    )
+                ),
+                loop,
+            )
+            future.result(timeout=RUNTIME_SETTING_TIMEOUT_SECONDS)
+
         try:
             speaker.start()
             await client.update_session(
@@ -225,6 +255,7 @@ async def _run_conversation(
                     documents_enabled=documents_enabled,
                 )
             )
+            config.bind(apply_setting)
 
             microphone.start()
             tasks = {
@@ -255,6 +286,7 @@ async def _run_conversation(
             for task in done:
                 task.result()
         finally:
+            config.unbind()
             microphone.stop()
             for task in tasks:
                 if not task.done():
@@ -264,7 +296,8 @@ async def _run_conversation(
             speaker.stop()
 
 
-async def run(parameters: Any) -> None:
+async def run(config: AppConfig) -> None:
+    parameters = config.parameters
     robot = None
     agent_client = None
     agents = None
@@ -287,7 +320,7 @@ async def run(parameters: Any) -> None:
         Logger.info(f"Enabling QTrobot camera as {camera_endpoint}...")
         robot.enable_plugin_zmq("realsense-driver", endpoint=camera_endpoint)
 
-        robot.speaker.set_volume(float(parameters.robot.volume))
+        robot.speaker.set_volume(float(parameters.robot.volume) / 100.0)
 
         params = robot.microphone.get_int_tuning()
         Logger.info(f"AGCONOFF: {params.get('AGCONOFF')}, AGCGAIN: {params.get('AGCGAIN')}.")
@@ -296,8 +329,8 @@ async def run(parameters: Any) -> None:
             "media_fg",
             pitch_semitones=float(parameters.robot.pitch_semitones),
         )
-        config = robot.talking_behavior.get_source_config("media_fg")
-        Logger.info(f"pitch shifting: {config['pitch_semitones']}")
+        source_config = robot.talking_behavior.get_source_config("media_fg")
+        Logger.info(f"pitch shifting: {source_config['pitch_semitones']}")
 
         robot.motor.home_all()
 
@@ -344,6 +377,7 @@ async def run(parameters: Any) -> None:
         reminder_tools = ReminderTools(emit_background_event)
         memory_enabled = bool(parameters.memory.enabled)
         documents_enabled = bool(parameters.documents.enabled)
+        documents_available = False
         memory_tools = None
         document_index = ""
         if memory_enabled or documents_enabled:
@@ -357,10 +391,12 @@ async def run(parameters: Any) -> None:
                 documents_directory = _resolve_project_path(
                     parameters.documents.directory
                 )
-                for document in DirectoryReader.read(
+                documents = DirectoryReader.read(
                     documents_directory,
                     summary=str(parameters.documents.summary),
-                ):
+                )
+                documents_available = bool(documents)
+                for document in documents:
                     long_term.add_document(
                         text=document.text,
                         summary=document.summary,
@@ -370,13 +406,15 @@ async def run(parameters: Any) -> None:
                         "Loaded document into long-term memory: "
                         f"{document.meta['source']}"
                     )
-                long_term.wait_for_documents()
-                document_index = long_term.document_index_summary()
-            memory_tools = MemoryTools(
-                long_term,
-                memory_enabled=memory_enabled,
-                documents_enabled=documents_enabled,
-            )
+                if documents_available:
+                    long_term.wait_for_documents()
+                    document_index = long_term.document_index_summary()
+            if memory_enabled or documents_available:
+                memory_tools = MemoryTools(
+                    long_term,
+                    memory_enabled=memory_enabled,
+                    documents_enabled=documents_available,
+                )
 
         providers = [user_tools, reminder_tools]
         if memory_tools is not None:
@@ -398,7 +436,8 @@ async def run(parameters: Any) -> None:
             )
             await tool_engine.discover()
             await _run_conversation(
-                parameters,
+                config,
+                robot,
                 microphone,
                 speaker,
                 tool_engine,
@@ -407,7 +446,7 @@ async def run(parameters: Any) -> None:
                 document_index,
                 web_search_available,
                 memory_enabled,
-                documents_enabled,
+                documents_available,
             )
     finally:
         if human_attention is not None:
@@ -445,10 +484,10 @@ def main() -> int:
         if len(sys.argv) < 2 or sys.argv[1].startswith("-"):
             raise ValueError("Usage: python main.py <path-to-config.yaml> [options]")
         config_path = Path(sys.argv[1]).expanduser()
-        parameters = Paramify(str(config_path)).parameters
-        Logger.set_level(str(parameters.log_level))
+        config = AppConfig(str(config_path))
+        Logger.set_level(str(config.parameters.log_level))
         Logger.info(f"QTrobot AI Agent starting with {config_path}")
-        asyncio.run(run(parameters))
+        asyncio.run(run(config))
     except KeyboardInterrupt:
         Logger.info("Conversation stopped.")
     except Exception as exc:

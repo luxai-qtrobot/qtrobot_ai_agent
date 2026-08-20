@@ -9,9 +9,13 @@ MEMORY_SEARCH_INSTRUCTIONS = """The recent conversation is already available in
 your context. Use search_memory only when you need information from an older
 conversation that is no longer visible."""
 
-DOCUMENT_SEARCH_INSTRUCTIONS = """Use search_documents when the answer may be
-found in the loaded reference documents. If no document inventory is listed,
-do not call search_documents."""
+DOCUMENT_SEARCH_INSTRUCTIONS = """## Document search
+
+The document inventory lists the available reference material. For every
+question related to its listed topics, products, documents, or research, you
+MUST call search_documents before answering, even if you think you already know
+the answer. Base the answer on the retrieved content. If the search does not
+contain the answer, say so instead of guessing. """
 
 MEMORY_TOOL_INSTRUCTIONS = (
     f"{MEMORY_SEARCH_INSTRUCTIONS}\n{DOCUMENT_SEARCH_INSTRUCTIONS}\n"

@@ -289,6 +289,8 @@ class S2SClient:
         self._connected = False
         self._session_ready = asyncio.Event()
         self._session_error: str | None = None
+        self._session_updated = asyncio.Event()
+        self._session_update_error: str | None = None
         self._session_close_accepted = asyncio.Event()
         # Event traffic is low-volume but semantically important (including
         # future tool calls), so the public queue never drops events.
@@ -359,8 +361,8 @@ class S2SClient:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
 
-        self._session_ready.clear()
-        self._session_error = None
+        self._session_updated.clear()
+        self._session_update_error = None
         event = {"type": "session.update", "session": dict(session)}
         deadline = time.monotonic() + timeout
 
@@ -373,15 +375,16 @@ class S2SClient:
                 )
             try:
                 await asyncio.wait_for(
-                    self._session_ready.wait(),
+                    self._session_updated.wait(),
                     timeout=min(SESSION_UPDATE_RETRY_SECONDS, remaining),
                 )
             except asyncio.TimeoutError:
                 continue
 
-            if self._session_error is not None:
+            if self._session_update_error is not None:
                 raise RuntimeError(
-                    f"S2S session configuration failed: {self._session_error}"
+                    "S2S session configuration failed: "
+                    f"{self._session_update_error}"
                 )
             return
 
@@ -555,6 +558,8 @@ class S2SClient:
         self._event_frame_id = 0
         self._session_ready = asyncio.Event()
         self._session_error = None
+        self._session_updated = asyncio.Event()
+        self._session_update_error = None
         self._session_close_accepted = asyncio.Event()
         self._event_queue = asyncio.Queue()
         self._event_reader_error = None
@@ -638,6 +643,8 @@ class S2SClient:
                 if not self._session_ready.is_set():
                     self._session_error = str(exc)
                     self._session_ready.set()
+                self._session_update_error = str(exc)
+                self._session_updated.set()
                 Logger.error(f"S2S event reader failed: {exc}")
         finally:
             self._end_event_stream()
@@ -649,18 +656,22 @@ class S2SClient:
         event_type = event.get("type")
         if event_type == "session.updated":
             self._session_ready.set()
+            self._session_updated.set()
         elif event_type == "magpie.session.closing":
             self._session_close_accepted.set()
         elif event_type == "magpie.session.closed":
             self._session_close_accepted.set()
-        elif event_type == "error" and not self._session_ready.is_set():
+        elif event_type == "error" and not self._session_updated.is_set():
             error = event.get("error")
             if isinstance(error, Mapping):
                 message = str(error.get("message") or error)
             else:
                 message = str(error or event)
-            self._session_error = message
-            self._session_ready.set()
+            self._session_update_error = message
+            self._session_updated.set()
+            if not self._session_ready.is_set():
+                self._session_error = message
+                self._session_ready.set()
 
     def _enqueue_event(self, frame: DictFrame) -> None:
         self._event_queue.put_nowait(frame)
