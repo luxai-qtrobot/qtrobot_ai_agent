@@ -42,10 +42,7 @@ Traditional voice assistants often react to every short silence, cut users off, 
 
 - Semantic end-of-turn detection distinguishes a thoughtful pause from a completed turn.
 - Smart Turn helps keep long or hesitant speech as one coherent user turn.
-- Barge-in promptly cancels active generation and already-buffered robot audio.
-- Cancelled or stale responses are prevented from leaking into later turns.
 - Audio, events, tool calls, agents, and robot playback run concurrently.
-- Recent conversation and compacted history are managed by the S2S session.
 
 The result is a fluent, responsive interaction in which users can speak naturally instead of adapting their speech to the robot.
 
