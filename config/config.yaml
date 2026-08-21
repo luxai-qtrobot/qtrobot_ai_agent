@@ -80,7 +80,7 @@ parameters:
 
   - name: voice
     type: str
-    value: Aiden
+    value: rosie
     description: Default synthesized voice
     scope: all
     label: Voice
