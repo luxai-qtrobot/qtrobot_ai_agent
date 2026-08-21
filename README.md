@@ -18,9 +18,11 @@ This is more than a voice chatbot. QTrobot understands when a person has actuall
 - [Technology stack](#technology-stack)
 - [Getting started](#getting-started)
   - [Requirements](#requirements)
-  - [1. Verify or install the robot services](#1-verify-or-install-the-robot-services)
-  - [2. Install the application](#2-install-the-application)
-  - [3. Run the assistant](#3-run-the-assistant)
+  - [1. Check whether the demo is already installed](#1-check-whether-the-demo-is-already-installed)
+  - [2. Verify or install the robot services](#2-verify-or-install-the-robot-services)
+  - [3. Install the application](#3-install-the-application)
+  - [4. Run the assistant manually](#4-run-the-assistant-manually)
+  - [5. Run automatically at startup](#5-run-automatically-at-startup)
 - [Configuration and Web UI](#configuration-and-web-ui)
 - [Customization](#customization)
   - [Customize QTrobot's role and personality](#customize-qtrobots-role-and-personality)
@@ -139,7 +141,30 @@ The Parakeet model recognizes 25 European languages automatically. The supplied 
 - The QTrobot human-detector service when human attention is enabled.
 - A Tavily API key only if optional web search is enabled.
 
-### 1. Verify or install the robot services
+### 1. Check whether the demo is already installed
+
+New QTrobots may already include the application under:
+
+```text
+/home/qtrobot/robot/code/qtrobot_ai_agent
+```
+
+Check both the application service and repository:
+
+```bash
+systemctl status qtrobot-ai-agent.service
+ls /home/qtrobot/robot/code/qtrobot_ai_agent
+```
+
+If they are present, start the demo and enable it for future robot startups:
+
+```bash
+sudo systemctl enable --now qtrobot-ai-agent.service
+```
+
+If systemd reports that the unit cannot be found, or the repository directory is missing, continue with the installation steps below.
+
+### 2. Verify or install the robot services
 
 Open a terminal on the QTPC. Recent QTrobotAI@Edge images may already include the required services, so check them first:
 
@@ -192,14 +217,15 @@ sudo systemctl enable qtrobot-llama-cpp.service
 sudo systemctl enable luxai-s2s-magpie.service
 ```
 
-### 2. Install the application
+### 3. Install the application
 
-Clone the repository in the QTPC user's home directory:
+Clone the repository into the standard QTrobot code directory:
 
 ```bash
-cd ~
+mkdir -p ~/robot/code
+cd ~/robot/code
 git clone https://github.com/luxai-qtrobot/qtrobot_ai_agent.git
-cd ~/qtrobot_ai_agent
+cd ~/robot/code/qtrobot_ai_agent
 ```
 
 #### Install dependencies in a virtual environment
@@ -210,17 +236,46 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-### 3. Run the assistant
+### 4. Run the assistant manually
 
-The first run with documents or long-term memory enabled may download the FastEmbed embedding and reranking models. Optionally select a persistent cache location:
+If the system service is already running, stop it before launching another copy manually:
 
 ```bash
-cd ~/qtrobot_ai_agent
+sudo systemctl stop qtrobot-ai-agent.service
+```
+
+The first run with documents or long-term memory enabled may download the FastEmbed embedding and reranking models. Then start the application:
+
+```bash
+cd ~/robot/code/qtrobot_ai_agent
 source .venv/bin/activate
 python src/main.py config/config.yaml
 ```
 
 The configuration file is required as the first argument. Wait for the S2S session-ready message, then speak normally to QTrobot. Press `Ctrl+C` to stop.
+
+### 5. Run automatically at startup
+
+After installing the application and its virtual environment, run the included installer from the repository:
+
+```bash
+cd ~/robot/code/qtrobot_ai_agent
+bash scripts/install_service.sh
+```
+
+The script uses the current repository, virtual environment, and configuration paths. It installs `qtrobot-ai-agent.service`, enables it at startup, and starts it immediately.
+
+Use these commands to manage the demo:
+
+| Action | Command |
+|---|---|
+| Check its status | `sudo systemctl status qtrobot-ai-agent.service` |
+| Follow its logs | `sudo journalctl -u qtrobot-ai-agent.service -f` |
+| Start it | `sudo systemctl start qtrobot-ai-agent.service` |
+| Stop it | `sudo systemctl stop qtrobot-ai-agent.service` |
+| Restart after changing configuration | `sudo systemctl restart qtrobot-ai-agent.service` |
+| Enable automatic startup | `sudo systemctl enable qtrobot-ai-agent.service` |
+| Disable automatic startup and stop it | `sudo systemctl disable --now qtrobot-ai-agent.service` |
 
 ## Configuration and Web UI
 
