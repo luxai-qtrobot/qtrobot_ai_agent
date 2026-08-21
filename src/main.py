@@ -351,6 +351,8 @@ async def run(config: AppConfig) -> None:
 
         robot.speaker.set_volume(float(parameters.robot.volume) / 100.0)
 
+        robot.microphone.set_int_tuning(name="AGCONOFF", value=0.0)
+        robot.microphone.set_int_tuning(name="AGCGAIN", value=15.0)
         params = robot.microphone.get_int_tuning()
         Logger.info(f"AGCONOFF: {params.get('AGCONOFF')}, AGCGAIN: {params.get('AGCGAIN')}.")
 
