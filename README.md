@@ -10,8 +10,6 @@ This is more than a voice chatbot. QTrobot understands when a person has actuall
 
 > This repository is both a ready-to-run demo and a clean baseline for building custom QTrobot tools, agents, personalities, and knowledge assistants.
 
-![QTrobot AI Agent Web UI with pause, volume, and voice controls](assets/web_ui.png)
-
 ## Table of contents
 
 - [Why this demo feels natural](#why-this-demo-feels-natural)
@@ -375,6 +373,8 @@ Add its absolute path to the voice selector in `config/config.yaml`:
 Restart the application so the new option appears, then select it from the Web UI. To make it the startup voice, also set `value` to the same absolute path.
 
 The `robot.pitch_semitones` setting adjusts QTrobot's foreground playback pitch at startup. It is separate from Qwen's generated voice character.
+
+![QTrobot AI Agent Web UI with pause, volume, and voice controls](assets/web_ui.png)
 
 ## Command-line options
 
