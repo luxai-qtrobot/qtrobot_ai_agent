@@ -8,6 +8,13 @@ parameters:
   description: Application log level
   scope: cli
 
+- name: paused
+  type: bool
+  value: false
+  description: Pause microphone and speaker interaction
+  scope: runtime
+  label: Pause interaction
+
 - name: robot
   type: group
   description: QTrobot connection and audio settings
@@ -20,7 +27,7 @@ parameters:
 
   - name: volume
     type: int
-    value: 79
+    value: 80
     description: Speaker volume from 0 to 100
     scope: all
     label: Speaker volume
@@ -31,7 +38,7 @@ parameters:
 
   - name: pitch_semitones
     type: double
-    value: 1.0
+    value: 0.0
     description: Foreground audio pitch shift
     scope: cli
 
@@ -79,8 +86,7 @@ parameters:
     label: Voice
     ui:
       element: "select"
-      items: ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna",
-        "Sohee"]
+      items: ["rosie", "aiden"]
 
 - name: web_search
   type: group

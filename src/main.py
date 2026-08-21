@@ -26,6 +26,7 @@ from s2s import S2SClient, ToolCallCoordinator
 from s2s._internal_instructions import (
     BACKGROUND_EVENT_INSTRUCTIONS,
     CAMERA_INSTRUCTIONS,
+    EMBODIED_INTERACTION_INSTRUCTIONS,
     WEB_SEARCH_INSTRUCTIONS,
 )
 from tool import (
@@ -49,10 +50,10 @@ RUNTIME_SETTING_TIMEOUT_SECONDS = 15.0
 # Keep the initial robot surface deliberately small. Local get_datetime and
 # get_image are discovered independently through LocalToolServer.
 ROBOT_TOOL_WHITELIST = {
-    # "face_emotion_list": None,
-    # "face_emotion_show": "face_emotion_stop",
-    # "gesture_file_list": None,
-    # "gesture_file_play": "gesture_cancel",
+    "face_emotion_list": None,
+    "face_emotion_show": "face_emotion_stop",
+    "gesture_file_list": None,
+    "gesture_file_play": "gesture_cancel",
     "motor_move_home_all": None,
     "speaker_volume_get": None,
     "speaker_volume_set": None,
@@ -83,6 +84,7 @@ def _session_config(
         base_instructions,
         BACKGROUND_EVENT_INSTRUCTIONS,
         CAMERA_INSTRUCTIONS,
+        EMBODIED_INTERACTION_INSTRUCTIONS,
     ]
     if web_search_enabled:
         instruction_sections.append(WEB_SEARCH_INSTRUCTIONS)
@@ -94,7 +96,7 @@ def _session_config(
         instruction_sections.append(retrieval_instructions)
     if document_index:
         instruction_sections.append(document_index)
-    Logger.warning(instruction_sections)
+
     session = {
         "type": "realtime",
         "instructions": "\n\n".join(instruction_sections),
@@ -114,9 +116,15 @@ def _session_config(
     return session
 
 
-async def _send_microphone( microphone: RobotMicSource, client: S2SClient ) -> None:
+async def _send_microphone(
+    microphone: RobotMicSource,
+    client: S2SClient,
+    interaction_paused: asyncio.Event,
+) -> None:
     while True:
-        client.send_audio(await microphone.read())
+        frame = await microphone.read()
+        if not interaction_paused.is_set():
+            client.send_audio(frame)
 
 
 async def _interrupt_speaker(speaker: RobotSpeakerSink) -> None:
@@ -131,8 +139,14 @@ async def _interrupt_speaker(speaker: RobotSpeakerSink) -> None:
         raise
 
 
-async def _play_audio(client: S2SClient, speaker: RobotSpeakerSink) -> None:
+async def _play_audio(
+    client: S2SClient,
+    speaker: RobotSpeakerSink,
+    interaction_paused: asyncio.Event,
+) -> None:
     async for frame in client.receive_audio():
+        if interaction_paused.is_set():
+            continue
         response_key = frame.response_key or str(frame.gid)
         if frame.cancelled:
             # Cancellation is authoritative on the ordered ZMQ audio stream.
@@ -217,10 +231,29 @@ async def _run_conversation(
     async with S2SClient(endpoint=str(parameters.s2s.endpoint)) as client:
         tool_calls = ToolCallCoordinator(client, tool_engine)
         loop = asyncio.get_running_loop()
+        interaction_paused = asyncio.Event()
+        if bool(parameters.paused):
+            interaction_paused.set()
+
+        async def set_paused(paused: bool) -> None:
+            if paused:
+                interaction_paused.set()
+                await _interrupt_speaker(speaker)
+                Logger.info("Interaction paused.")
+            else:
+                interaction_paused.clear()
+                Logger.info("Interaction resumed.")
 
         def apply_setting(name: str, value: object) -> None:
             if name == "volume":
                 robot.speaker.set_volume(float(value) / 100.0)
+                return
+            if name == "paused":
+                future = asyncio.run_coroutine_threadsafe(
+                    set_paused(bool(value)),
+                    loop,
+                )
+                future.result(timeout=RUNTIME_SETTING_TIMEOUT_SECONDS)
                 return
             if name not in {"voice", "instructions"}:
                 raise ValueError(f"Unsupported live setting: {name}")
@@ -259,11 +292,11 @@ async def _run_conversation(
             microphone.start()
             tasks = {
                 asyncio.create_task(
-                    _send_microphone(microphone, client),
+                    _send_microphone(microphone, client, interaction_paused),
                     name="qtrobot-microphone-to-s2s",
                 ),
                 asyncio.create_task(
-                    _play_audio(client, speaker),
+                    _play_audio(client, speaker, interaction_paused),
                     name="s2s-audio-to-qtrobot-speaker",
                 ),
                 asyncio.create_task(

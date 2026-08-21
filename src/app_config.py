@@ -36,3 +36,6 @@ class AppConfig(ParamifyWeb):
 
     def on_assistant_instructions_set(self, value: str) -> None:
         self._apply("instructions", value)
+
+    def on_paused_set(self, value: bool) -> None:
+        self._apply("paused", bool(value))
