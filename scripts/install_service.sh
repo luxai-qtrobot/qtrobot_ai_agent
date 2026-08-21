@@ -53,7 +53,7 @@ Wants=network-online.target qtrobot-llama-cpp.service luxai-s2s-magpie.service
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
-WorkingDirectory="$PROJECT_DIR_ESCAPED"
+WorkingDirectory=$PROJECT_DIR_ESCAPED
 ExecStart="$VENV_PYTHON_ESCAPED" "$MAIN_SCRIPT_ESCAPED" "$CONFIG_FILE_ESCAPED"
 Environment="HOME=$SERVICE_HOME_ESCAPED"
 Environment="PYTHONUNBUFFERED=1"
