@@ -2,7 +2,7 @@
 
 **Fluent, multilingual, multimodal conversation on QTrobotAI@Edge**
 
-**QTrobot AI Agent** turns [QTrobot](https://luxai.com/humanoid-social-robot-for-research-and-teaching/) into a natural, expressive, and extensible conversational assistant. It combines interruption-aware speech-to-speech interaction, automatic language recognition, a multilingual voice with natural prosody, camera-grounded visual understanding, local document search, long-term memory, reminders, robot actions, and background web research in one complete reference application.
+**QTrobot AI Agent** turns [QTrobot](https://luxai.com/humanoid-social-robot-for-research-and-teaching/) into a natural, expressive, and extensible conversational assistant. It combines interruption-aware speech-to-speech interaction, automatic language recognition, multilingual voice cloning with natural prosody, camera-grounded visual understanding, local document search, long-term memory, reminders, robot actions, and background web research in one complete reference application.
 
 This is more than a voice chatbot. QTrobot understands when a person has actually finished speaking, tolerates natural pauses, supports barge-in, suppresses stale responses, keeps recent conversation context, calls tools in parallel, and can continue talking while longer-running agents work in the background.
 
@@ -10,7 +10,7 @@ This is more than a voice chatbot. QTrobot understands when a person has actuall
 
 > This repository is both a ready-to-run demo and a clean baseline for building custom QTrobot tools, agents, personalities, and knowledge assistants.
 
-<!-- Paramify Web UI screenshot will be inserted here when the image is available. -->
+![QTrobot AI Agent Web UI with pause, volume, and voice controls](assets/web_ui.png)
 
 ## Table of contents
 
@@ -29,7 +29,7 @@ This is more than a voice chatbot. QTrobot understands when a person has actuall
   - [Use your own documents](#use-your-own-documents)
   - [Enable long-term memory](#enable-long-term-memory)
   - [Enable background web search](#enable-background-web-search)
-  - [Choose a voice](#choose-a-voice)
+  - [Choose or add a voice](#choose-or-add-a-voice)
 - [Command-line options](#command-line-options)
 - [Extending the demo](#extending-the-demo)
 - [Troubleshooting](#troubleshooting)
@@ -55,10 +55,10 @@ The result is a fluent, responsive interaction in which users can speak naturall
   NVIDIA Parakeet-TDT automatically detects the spoken language. The bundled end-to-end setup supports English, French, German, Italian, Portuguese, Russian, and Spanish without selecting a language or restarting the service.
 
 - **One consistent multilingual personality**
-  The selected Qwen3-TTS voice remains the robot's voice as the conversation changes language, preserving a consistent identity across multilingual interactions.
+  The selected cloned Qwen3-TTS voice remains the robot's voice as the conversation changes language, preserving a consistent identity across multilingual interactions.
 
-- **Expressive, natural speech**
-  Qwen3-TTS generates natural rhythm, emphasis, and contextual prosody instead of relying on a conventional fixed TTS voice. Nine distinct voice characters are available.
+- **Expressive speech and voice cloning**
+  Qwen3-TTS generates natural rhythm, emphasis, and contextual prosody. The demo includes the `rosie` and `aiden` voices, and a short WAV recording can give QTrobot a new custom voice.
 
 - **On-device multimodal intelligence**
   The default Gemma 4 12B model runs through llama.cpp on the Jetson AGX Orin and receives text, conversation context, tool results, and camera images.
@@ -70,7 +70,7 @@ The result is a fluent, responsive interaction in which users can speak naturall
   Application tools and QTrobot SDK tools are discovered through MCP. Independent tool calls can run in parallel while audio and events continue flowing.
 
 - **Physical robot actions**
-  The default safe tool surface lets the model move QTrobot to its home position and read or change the speaker volume. More QTrobot MCP tools can be enabled explicitly.
+  QTrobot combines facial expressions and gestures with speech to create more natural, embodied, and engaging interactions. It can also change its speaker volume upon user request. 
 
 - **Concurrent reminders and timers**
   QTrobot can set, list, and cancel multiple reminders. A due reminder enters the ongoing conversation as a trusted background event at the correct time. Reminders are held in memory and do not survive an application restart.
@@ -88,7 +88,7 @@ The result is a fluent, responsive interaction in which users can speak naturall
   QTrobot tracks a nearby engaged person, smooths its gaze, avoids rapid switching, and performs occasional natural idle looks.
 
 - **Live Web configuration**
-  Paramify Web provides a browser interface for changing speaker volume, voice, and assistant instructions while the application is running. Successful UI changes are saved back to the YAML configuration.
+  Paramify Web provides a browser interface for pausing interaction and changing speaker volume or voice while the application is running. Successful UI changes are saved back to the YAML configuration.
 
 - **Reusable developer architecture**
   The MAGPIE S2S client is independent of QTrobot audio hardware. Tools, delayed background operations, and isolated agents have clear extension points for new applications.
@@ -120,14 +120,14 @@ Once the assistant is ready, try prompts such as:
 | Speech-to-speech runtime | [luxai-s2s-magpie](https://github.com/luxai-qtrobot/s2s-magpie) | Session state, VAD, turn taking, response ordering, tool events, and cancellation |
 | Speech recognition | [NVIDIA Parakeet-TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Fast multilingual ASR with automatic language detection |
 | Language model | Gemma 4 12B IT Q8_0 through [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local conversation, reasoning, multimodal understanding, and tool selection |
-| Speech synthesis | [Qwen3-TTS 0.6B CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | Expressive multilingual speech with nine voice characters |
+| Speech synthesis | [Qwen3-TTS 0.6B Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Expressive multilingual speech cloned from short reference recordings |
 | Tools | MAGPIE MCP + FastMCP | Local tools, QTrobot tools, discovery, parallel execution, and result normalization |
 | Document and memory retrieval | FastEmbed BGE embeddings + cross-encoder reranking | Semantic retrieval over documents and older conversations |
 | Web research | Tavily + Trafilatura + isolated agent | Search, page extraction, synthesis, and background completion events |
 | Runtime configuration | [Paramify](https://github.com/luxai-qtrobot/paramify) | YAML schema, generated CLI, persistent Web UI, and live callbacks |
 | Robot integration | [LuxAI Robot Python SDK](https://docs.luxai.com/docs/v3/api_python) | Microphone, speaker, camera, motor, perception, and kinematics |
 
-The Parakeet model recognizes 25 European languages automatically. The supplied assistant configuration advertises the seven-language intersection tested with the complete ASR-to-TTS pipeline: English, French, German, Italian, Portuguese, Russian, and Spanish. Qwen3-TTS itself supports ten languages and can synthesize any supported language with any of its nine voices.
+The Parakeet model recognizes 25 European languages automatically. The supplied assistant configuration advertises the seven-language intersection tested with the complete ASR-to-TTS pipeline: English, French, German, Italian, Portuguese, Russian, and Spanish. The bundled `rosie` and `aiden` voices, as well as user-provided cloned voices, can follow the conversation across these languages.
 
 ## Getting started
 
@@ -240,9 +240,9 @@ The Web UI exposes three intentionally safe live controls:
 
 | Live setting | Effect |
 |---|---|
+| Pause interaction | Stops microphone input and robot speech playback while background work continues |
 | Speaker volume | Immediately changes QTrobot volume from 0 to 100 |
-| Voice | Updates the active S2S session with the selected Qwen3 voice |
-| Assistant instructions | Updates the active session's role and behavior without losing its recent conversation |
+| Voice | Changes the active cloned voice without restarting the conversation |
 
 Successful changes from the Web UI are persisted directly to the YAML file. Command-line overrides are intentionally temporary.
 
@@ -254,7 +254,7 @@ The remaining options are startup settings because they affect network connectio
 
 The editable `assistant.instructions` field defines QTrobot's identity, speaking style, audience, and scenario. Internal instructions for tools, visual grounding, document retrieval, and background events are appended automatically, so users can focus on the application role.
 
-Edit it in `config/config.yaml` or live through the Web UI:
+Edit it in `config/config.yaml`, then restart the application:
 
 ```yaml
 - name: instructions
@@ -264,10 +264,7 @@ Edit it in `config/config.yaml` or live through the Web UI:
     Be warm, playful, encouraging, and concise.
     Always answer in the language used by the user.
   description: Assistant system instructions
-  scope: runtime
-  label: Assistant instructions
-  ui:
-    element: textarea
+  scope: cli
 ```
 
 Here are a few application ideas.
@@ -344,23 +341,38 @@ Web search is optional and disabled by default. Obtain a [Tavily](https://tavily
 
 Web research runs in the background, so QTrobot can continue the conversation and naturally share the result when it is ready.
 
-### Choose a voice
+### Choose or add a voice
 
-Change the voice live through Paramify Web, in YAML, or for one run with `--s2s-voice`.
+The demo includes two ready-to-use cloned voices:
 
-| Voice | Character | Native language |
-|---|---|---|
-| `Vivian` | Bright young female | Chinese |
-| `Serena` | Warm, gentle young female | Chinese |
-| `Uncle_Fu` | Low, mellow mature male | Chinese |
-| `Dylan` | Clear, youthful Beijing male | Chinese |
-| `Eric` | Lively, slightly husky male | Chinese |
-| `Ryan` | Dynamic, rhythmic male | English |
-| `Aiden` | Sunny American male | English |
-| `Ono_Anna` | Playful, light female | Japanese |
-| `Sohee` | Warm female with rich emotion | Korean |
+- `rosie`
+- `aiden`
 
-Each voice can synthesize every language supported by the Qwen3-TTS model, although its native language usually provides the strongest accent and quality.
+Switch between them live through Paramify Web, in YAML, or for one run with `--s2s-voice`.
+
+#### Add your own voice
+
+Record a clean 10-15 second voice sample and save it as a WAV file. A mono 16 kHz recording is a good default. Copy the file somewhere on the QTPC, for example:
+
+```text
+/home/qtrobot/myvoice.wav
+```
+
+Add its absolute path to the voice selector in `config/config.yaml`:
+
+```yaml
+- name: voice
+  type: str
+  value: rosie
+  description: Default synthesized voice
+  scope: all
+  label: Voice
+  ui:
+    element: select
+    items: ["rosie", "aiden", "/home/qtrobot/myvoice.wav"]
+```
+
+Restart the application so the new option appears, then select it from the Web UI. To make it the startup voice, also set `value` to the same absolute path.
 
 The `robot.pitch_semitones` setting adjusts QTrobot's foreground playback pitch at startup. It is separate from Qwen's generated voice character.
 
@@ -384,7 +396,8 @@ Available generated overrides:
 | `--human-attention-enabled` / `--no-human-attention-enabled` | Enable or disable human tracking |
 | `--human-attention-detector-endpoint ENDPOINT` | Set human-detector endpoint |
 | `--s2s-endpoint ENDPOINT` | Set S2S descriptor RPC endpoint |
-| `--s2s-voice VOICE` | Select initial Qwen3 voice |
+| `--s2s-voice VOICE` | Select a bundled voice or an absolute WAV path |
+| `--assistant-instructions TEXT` | Override the assistant role and behavior |
 | `--web-search-enabled` / `--no-web-search-enabled` | Enable or disable web search |
 | `--web-search-api-key KEY` | Supply Tavily API key |
 | `--documents-enabled` / `--no-documents-enabled` | Enable or disable document RAG |
@@ -397,12 +410,12 @@ Example:
 
 ```bash
 python src/main.py config/config.yaml \
-  --s2s-voice Ono_Anna \
+  --s2s-voice aiden \
   --memory-enabled \
   --documents-directory /home/qtrobot/Documents/my-knowledge
 ```
 
-Assistant instructions are intentionally edited in YAML or through the live Web UI rather than passed as a long shell argument.
+For longer assistant instructions, editing the multiline YAML value is usually more convenient than passing a shell argument.
 
 ## Extending the demo
 

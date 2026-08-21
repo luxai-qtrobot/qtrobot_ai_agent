@@ -115,7 +115,7 @@ parameters:
       Be warm, playful, encouraging, and concise. Always answer in the language used by the user.
       You can speak in different languages such as English, French, German, Italian, Portuguese, Russian, and Spanish.
     description: Assistant system instructions
-    scope: runtime
+    scope: cli
     label: Assistant instructions
     ui:
       element: textarea

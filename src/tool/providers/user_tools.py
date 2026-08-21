@@ -10,7 +10,7 @@ from simplejpeg import decode_jpeg, encode_jpeg, is_jpeg
 
 from luxai.magpie.schema import McpSchema
 from luxai.magpie.utils import Logger
-from luxai.robot.core import Robot
+from luxai.robot.core import ActionHandle, Robot
 
 from ..tool_base import ToolBase
 
@@ -43,20 +43,45 @@ def _resize_to_camera_limit(image: np.ndarray) -> np.ndarray:
 
 
 class UserTools(ToolBase):
-    """Date/time and camera tools owned by this application."""
+    """Application-owned date/time, camera, and expressive robot tools."""
 
     def __init__(self, robot: Robot) -> None:
         super().__init__()
+        self._robot = robot
         self._camera_lock = threading.Lock()
         self._camera_reader = robot.camera.stream.open_color_reader(queue_size=1)
 
     def register(self, schema: McpSchema) -> None:
         schema.method()(self.get_datetime)
         schema.method()(self.get_image)
+        schema.method()(self.face_emotion_show)
+        schema.method()(self.gesture_file_play)
 
     def get_datetime(self) -> str:
         """Get the current local date and time."""
         return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def face_emotion_show(self, emotion: str) -> str:
+        """Start showing a facial emotion without waiting for it to finish."""
+        handle = self._robot.face.show_emotion_async(emotion)
+        self._log_action_failure(handle, f"facial emotion {emotion!r}")
+        return f"Facial emotion {emotion!r} started."
+
+    def gesture_file_play(self, gesture: str) -> str:
+        """Start playing a gesture without waiting for it to finish."""
+        handle = self._robot.gesture.play_file_async(gesture)
+        self._log_action_failure(handle, f"gesture {gesture!r}")
+        return f"Gesture {gesture!r} started."
+
+    @staticmethod
+    def _log_action_failure(handle: ActionHandle, description: str) -> None:
+        def completed(action: ActionHandle) -> None:
+            try:
+                action.result()
+            except Exception as exc:
+                Logger.warning(f"QTrobot {description} failed: {exc}")
+
+        handle.add_done_callback(completed)
 
     def get_image(self) -> dict[str, str]:
         """Capture the current view from QTrobot's color camera.

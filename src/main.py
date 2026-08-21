@@ -51,9 +51,7 @@ RUNTIME_SETTING_TIMEOUT_SECONDS = 15.0
 # get_image are discovered independently through LocalToolServer.
 ROBOT_TOOL_WHITELIST = {
     "face_emotion_list": None,
-    "face_emotion_show": "face_emotion_stop",
     "gesture_file_list": None,
-    "gesture_file_play": "gesture_cancel",
     "motor_move_home_all": None,
     "speaker_volume_get": None,
     "speaker_volume_set": None,
