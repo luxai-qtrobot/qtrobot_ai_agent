@@ -234,6 +234,8 @@ http://localhost:5000
 
 Open this address in the QTPC browser. From another computer connected to the same Wi-Fi or local network, use `http://QTPC_IP:5000`.
 
+![QTrobot AI Agent Web UI with pause, volume, and voice controls](assets/web_ui.png)
+
 The Web UI exposes three intentionally safe live controls:
 
 | Live setting | Effect |
@@ -373,8 +375,6 @@ Add its absolute path to the voice selector in `config/config.yaml`:
 Restart the application so the new option appears, then select it from the Web UI. To make it the startup voice, also set `value` to the same absolute path.
 
 The `robot.pitch_semitones` setting adjusts QTrobot's foreground playback pitch at startup. It is separate from Qwen's generated voice character.
-
-![QTrobot AI Agent Web UI with pause, volume, and voice controls](assets/web_ui.png)
 
 ## Command-line options
 
