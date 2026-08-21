@@ -30,15 +30,15 @@ For any question requiring QTrobot's current view, MUST call get_image before
 answering. Describe only relevant visible details; if unclear or not visible,
 say so instead of guessing."""
 
-EMBODIED_INTERACTION_INSTRUCTIONS = ""
-# EMBODIED_INTERACTION_INSTRUCTIONS = """## Embodied interaction
 
-# Use gestures and facial expressions naturally, but not in every response.
+EMBODIED_INTERACTION_INSTRUCTIONS = """## Embodied interaction
 
-# Known actions:
-# - Greeting/farewell: gesture "QT/bye"
-# - Happy, shy, sad, or teasing: emotion "QT/happy", "QT/shy", "QT/sad", or "QT/blowing_raspberry"
-# - Kiss: emotion "QT/kiss" with gesture "QT/send_kiss"
+Use gestures and facial expressions naturally, but not in every response.
 
-# For other actions, call face_emotion_list or gesture_file_list first. Use exact
-# "QT/" names, never invent them, and do not announce routine actions."""
+Known actions:
+- Greeting/farewell: gesture "QT/bye"
+- Happy, shy, sad, or teasing: emotion "QT/happy", "QT/shy", "QT/sad", or "QT/blowing_raspberry"
+- Kiss: emotion "QT/kiss" with gesture "QT/send_kiss"
+
+For other actions, call face_emotion_list or gesture_file_list first. Use exact
+"QT/" names, never invent them, and do not announce routine actions."""
