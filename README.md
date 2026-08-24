@@ -23,6 +23,7 @@ This is more than a voice chatbot. QTrobot understands when a person has actuall
   - [3. Install the application](#3-install-the-application)
   - [4. Run the assistant manually](#4-run-the-assistant-manually)
   - [5. Run automatically at startup](#5-run-automatically-at-startup)
+- [Choose a language model](#choose-a-language-model)
 - [Configuration and Web UI](#configuration-and-web-ui)
 - [Customization](#customization)
   - [Customize QTrobot's role and personality](#customize-qtrobots-role-and-personality)
@@ -61,7 +62,7 @@ The result is a fluent, responsive interaction in which users can speak naturall
   Qwen3-TTS generates natural rhythm, emphasis, and contextual prosody. The demo includes the `rosie` and `aiden` voices, and a short WAV recording can give QTrobot a new custom voice.
 
 - **On-device multimodal intelligence**
-  The default Gemma 4 12B model runs through llama.cpp on the Jetson AGX Orin and receives text, conversation context, tool results, and camera images.
+  The default Gemma 4 E4B model runs through llama.cpp on the Jetson AGX Orin and receives text, conversation context, tool results, and camera images.
 
 - **On-demand visual perception**
   When a question requires the current scene, QTrobot captures a fresh camera image and supplies it to the multimodal model. Responses are grounded in what is actually visible rather than an old scene description.
@@ -119,7 +120,7 @@ Once the assistant is ready, try prompts such as:
 | Communication | [LuxAI MAGPIE](https://github.com/luxai-qtrobot/magpie) | Native audio, events, RPC, discovery, and MCP transport |
 | Speech-to-speech runtime | [luxai-s2s-magpie](https://github.com/luxai-qtrobot/s2s-magpie) | Session state, VAD, turn taking, response ordering, tool events, and cancellation |
 | Speech recognition | [NVIDIA Parakeet-TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Fast multilingual ASR with automatic language detection |
-| Language model | Gemma 4 12B IT Q8_0 through [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local conversation, reasoning, multimodal understanding, and tool selection |
+| Language model | Gemma 4 E4B IT Q8_0 through [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local conversation, reasoning, multimodal understanding, and tool selection |
 | Speech synthesis | [Qwen3-TTS 0.6B Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Expressive multilingual speech cloned from short reference recordings |
 | Tools | MAGPIE MCP + FastMCP | Local tools, QTrobot tools, discovery, parallel execution, and result normalization |
 | Document and memory retrieval | FastEmbed BGE embeddings + cross-encoder reranking | Semantic retrieval over documents and older conversations |
@@ -184,7 +185,7 @@ sudo apt install qtrobot-llama-cpp
 sudo systemctl start qtrobot-llama-cpp.service
 ```
 
-The first start downloads the configured Gemma 4 model, multimodal projection, and draft model. Follow its progress with:
+The first start downloads the default Gemma 4 E4B model and its required assets. Follow its progress with:
 
 ```bash
 sudo journalctl -u qtrobot-llama-cpp.service -f
@@ -276,6 +277,53 @@ Use these commands to manage the demo:
 | Restart after changing configuration | `sudo systemctl restart qtrobot-ai-agent.service` |
 | Enable automatic startup | `sudo systemctl enable qtrobot-ai-agent.service` |
 | Disable automatic startup and stop it | `sudo systemctl disable --now qtrobot-ai-agent.service` |
+
+## Choose a language model
+
+The default **Gemma 4 E4B Q8** model provides the best tested balance of
+responsiveness, multimodal understanding, tool use, and conversational
+reliability for this demo. The `qtrobot-llama-cpp` service also includes several
+ready-to-use alternatives:
+
+| Model | Preset | Recommended use | Weighted speed on QTPC |
+|---|---|---|---:|
+| **Gemma 4 E4B Q8** (default) | `gemma4-e4b` | Best overall balance for responsive conversation, vision, and agentic tool use | **~35.6 tok/s** |
+| **Qwen3.5 9B Q8** | `qwen3.5-9b` | Recommended alternative for multimodal conversation, vision, agentic work, instruction following, and tool use | **~16.4 tok/s** |
+| **Gemma 4 12B Q8** | `gemma4-12b` | Strong reasoning and multimodal capability, but it may occasionally produce unusually long responses in this setup | **~21.6 tok/s** |
+| **Qwen3.8 27B Q8** | `qwen3.8-27b` | Highest-capability option for complex reasoning, advanced vision, coding, and long-horizon agentic work | **~9.1 tok/s** |
+
+Speeds are weighted output-generation measurements from QTrobot's Jetson AGX
+Orin 64GB and are approximate. Prompt length, conversation history, tool use,
+and generated response length all affect runtime performance.
+
+Qwen3.8 is a compelling quality-first local option. [Qwen's published
+evaluations](https://huggingface.co/Qwen/Qwen3.8-27B#benchmark-results) show it
+competing with Claude Opus 4.6 Max across several coding, agentic, instruction
+following, and vision benchmarks. These vendor benchmarks describe the model's
+capability; the speed above comes from the local Q8 configuration tested on
+QTPC.
+
+To switch models, edit the llama.cpp service configuration:
+
+```bash
+sudo nano /opt/luxai/qtrobot_llama_cpp/etc/server.env
+```
+
+Set `LLAMA_MODEL_PRESET` to one of the preset names in the table, for example:
+
+```env
+LLAMA_MODEL_PRESET=qwen3.5-9b
+```
+
+Then restart the local model service and follow its startup log:
+
+```bash
+sudo systemctl restart qtrobot-llama-cpp.service
+sudo journalctl -u qtrobot-llama-cpp.service -f
+```
+
+Missing files for the selected model are downloaded automatically on its first
+start. No change to the QTrobot AI Agent or S2S configuration is required.
 
 ## Configuration and Web UI
 
