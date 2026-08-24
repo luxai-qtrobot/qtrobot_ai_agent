@@ -46,6 +46,7 @@ DEFAULT_AGENT_LLM_BASE_URL     = "http://127.0.0.1:8080/v1"
 DEFAULT_AGENT_LLM_MODEL        = "Qwen3.5-9B-Q8_0.gguf"
 AGENT_LLM_TIMEOUT_SECONDS      = 60.0
 RUNTIME_SETTING_TIMEOUT_SECONDS = 15.0
+S2S_CONNECT_RETRY_SECONDS      = 3.0
 
 # Keep the initial robot surface deliberately small. Local get_datetime and
 # get_image are discovered independently through LocalToolServer.
@@ -211,6 +212,7 @@ async def _send_background_events(events: asyncio.Queue[dict], tool_calls: ToolC
 
 async def _run_conversation(
     config: AppConfig,
+    client: S2SClient,
     robot: Robot,
     microphone: RobotMicSource,
     speaker: RobotSpeakerSink,
@@ -225,7 +227,7 @@ async def _run_conversation(
     parameters = config.parameters
     tasks: set[asyncio.Task[None]] = set()
 
-    async with S2SClient(endpoint=str(parameters.s2s.endpoint)) as client:
+    async with client:
         tool_calls = ToolCallCoordinator(client, tool_engine)
         loop = asyncio.get_running_loop()
         interaction_paused = asyncio.Event()
@@ -325,8 +327,24 @@ async def _run_conversation(
             speaker.stop()
 
 
+async def _wait_for_s2s(client: S2SClient, endpoint: str) -> None:
+    while True:
+        try:
+            await client.connect()
+            Logger.info(f"S2S service is ready at {endpoint}.")
+            return
+        except Exception as exc:
+            Logger.info(
+                f"Waiting for S2S service at {endpoint}: {exc}. "
+                f"Retrying in {S2S_CONNECT_RETRY_SECONDS:g} seconds."
+            )
+            await asyncio.sleep(S2S_CONNECT_RETRY_SECONDS)
+
+
 async def run(config: AppConfig) -> None:
     parameters = config.parameters
+    s2s_endpoint = str(parameters.s2s.endpoint)
+    s2s_client = S2SClient(endpoint=s2s_endpoint)
     robot = None
     agent_client = None
     agents = None
@@ -338,6 +356,8 @@ async def run(config: AppConfig) -> None:
     human_attention = None
     long_term = None
     try:
+        await _wait_for_s2s(s2s_client, s2s_endpoint)
+
         robot_endpoint = str(parameters.robot.endpoint)
         Logger.info(f"Connecting to QTrobot ({robot_endpoint})...")
         robot = Robot.connect_zmq(endpoint=robot_endpoint)
@@ -468,6 +488,7 @@ async def run(config: AppConfig) -> None:
             await tool_engine.discover()
             await _run_conversation(
                 config,
+                s2s_client,
                 robot,
                 microphone,
                 speaker,
@@ -480,6 +501,10 @@ async def run(config: AppConfig) -> None:
                 documents_available,
             )
     finally:
+        try:
+            await s2s_client.close()
+        except Exception as exc:
+            Logger.warning(f"Could not close S2S client: {exc}")
         if human_attention is not None:
             human_attention.terminate(
                 timeout=HUMAN_IDLE_ATTENTION_TIMEOUT + 1.0

@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from luxai.magpie.frames import DictFrame
 
@@ -15,6 +17,8 @@ if str(SRC_DIR) not in sys.path:
 from main import (
     _log_event,
     _session_config,
+    _wait_for_s2s,
+    S2S_CONNECT_RETRY_SECONDS,
 )
 from s2s._internal_instructions import (
     BACKGROUND_EVENT_INSTRUCTIONS,
@@ -109,6 +113,19 @@ class MainSessionConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(memory.messages, [])
+
+
+class S2SReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_until_s2s_connects(self) -> None:
+        client = SimpleNamespace(
+            connect=AsyncMock(side_effect=[RuntimeError("not ready"), None])
+        )
+
+        with patch("main.asyncio.sleep", new=AsyncMock()) as sleep:
+            await _wait_for_s2s(client, "tcp://qtpc:50960")
+
+        self.assertEqual(client.connect.await_count, 2)
+        sleep.assert_awaited_once_with(S2S_CONNECT_RETRY_SECONDS)
 
 
 if __name__ == "__main__":
