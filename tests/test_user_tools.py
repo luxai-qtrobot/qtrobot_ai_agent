@@ -126,7 +126,7 @@ class UserToolsTests(unittest.TestCase):
         result = tools.get_image()
 
         resized = decode_jpeg(base64.b64decode(result["data"]), colorspace="BGR")
-        self.assertEqual(resized.shape, (360, 640, 3))
+        self.assertEqual(resized.shape, (472, 840, 3))
         tools.cleanup()
 
     def test_malformed_raw_frame_is_rejected(self) -> None:

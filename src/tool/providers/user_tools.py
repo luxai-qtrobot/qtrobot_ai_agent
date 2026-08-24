@@ -16,8 +16,8 @@ from ..tool_base import ToolBase
 
 
 CAMERA_READ_TIMEOUT = 2.0
-CAMERA_JPEG_QUALITY = 80
-CAMERA_IMAGE_MAX_SIZE = (640, 480)
+CAMERA_JPEG_QUALITY = 90
+CAMERA_IMAGE_MAX_SIZE = (840, 480)
 
 
 def _resize_to_camera_limit(image: np.ndarray) -> np.ndarray:
