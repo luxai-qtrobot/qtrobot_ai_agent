@@ -70,7 +70,21 @@ class UserTools(ToolBase):
     def gesture_file_play(self, gesture: str) -> str:
         """Start playing a gesture without waiting for it to finish."""
         handle = self._robot.gesture.play_file_async(gesture)
-        self._log_action_failure(handle, f"gesture {gesture!r}")
+
+        def completed(action: ActionHandle) -> None:
+            try:
+                action.result()
+            except Exception as exc:
+                Logger.warning(f"QTrobot gesture {gesture!r} failed: {exc}")
+
+            try:
+                self._robot.motor.home_all()
+            except Exception as exc:
+                Logger.warning(
+                    f"Could not return QTrobot home after gesture {gesture!r}: {exc}"
+                )
+
+        handle.add_done_callback(completed)
         return f"Gesture {gesture!r} started."
 
     @staticmethod

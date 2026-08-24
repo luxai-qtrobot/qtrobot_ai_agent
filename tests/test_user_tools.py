@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 from simplejpeg import decode_jpeg, encode_jpeg, is_jpeg
@@ -60,6 +61,27 @@ def _make_tools(frame=None) -> tuple[UserTools, _Reader, _ColorStream]:
 
 
 class UserToolsTests(unittest.TestCase):
+    def test_gesture_returns_home_after_successful_completion(self) -> None:
+        tools, _, _ = _make_tools()
+        handle = Mock()
+        gesture = Mock()
+        gesture.play_file_async.return_value = handle
+        motor = Mock()
+        tools._robot = SimpleNamespace(gesture=gesture, motor=motor)
+
+        result = tools.gesture_file_play("QT/bye")
+
+        self.assertEqual(result, "Gesture 'QT/bye' started.")
+        gesture.play_file_async.assert_called_once_with("QT/bye")
+        motor.home_all.assert_not_called()
+
+        completed = handle.add_done_callback.call_args.args[0]
+        completed(handle)
+
+        handle.result.assert_called_once_with()
+        motor.home_all.assert_called_once_with()
+        tools.cleanup()
+
     def test_registers_datetime_and_image(self) -> None:
         tools, _, _ = _make_tools()
         schema = McpSchema(name="test-tools")

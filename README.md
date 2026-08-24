@@ -62,7 +62,7 @@ The result is a fluent, responsive interaction in which users can speak naturall
   Qwen3-TTS generates natural rhythm, emphasis, and contextual prosody. The demo includes the `rosie` and `aiden` voices, and a short WAV recording can give QTrobot a new custom voice.
 
 - **On-device multimodal intelligence**
-  The default Gemma 4 E4B model runs through llama.cpp on the Jetson AGX Orin and receives text, conversation context, tool results, and camera images.
+  The default Qwen3.5 9B model runs through llama.cpp on the Jetson AGX Orin and receives text, conversation context, tool results, and camera images.
 
 - **On-demand visual perception**
   When a question requires the current scene, QTrobot captures a fresh camera image and supplies it to the multimodal model. Responses are grounded in what is actually visible rather than an old scene description.
@@ -120,7 +120,7 @@ Once the assistant is ready, try prompts such as:
 | Communication | [LuxAI MAGPIE](https://github.com/luxai-qtrobot/magpie) | Native audio, events, RPC, discovery, and MCP transport |
 | Speech-to-speech runtime | [luxai-s2s-magpie](https://github.com/luxai-qtrobot/s2s-magpie) | Session state, VAD, turn taking, response ordering, tool events, and cancellation |
 | Speech recognition | [NVIDIA Parakeet-TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | Fast multilingual ASR with automatic language detection |
-| Language model | Gemma 4 E4B IT Q8_0 through [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local conversation, reasoning, multimodal understanding, and tool selection |
+| Language model | Qwen3.5 9B Q8_0 through [llama.cpp](https://github.com/ggml-org/llama.cpp) | Local conversation, reasoning, multimodal understanding, and tool selection |
 | Speech synthesis | [Qwen3-TTS 0.6B Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Expressive multilingual speech cloned from short reference recordings |
 | Tools | MAGPIE MCP + FastMCP | Local tools, QTrobot tools, discovery, parallel execution, and result normalization |
 | Document and memory retrieval | FastEmbed BGE embeddings + cross-encoder reranking | Semantic retrieval over documents and older conversations |
@@ -185,7 +185,7 @@ sudo apt install qtrobot-llama-cpp
 sudo systemctl start qtrobot-llama-cpp.service
 ```
 
-The first start downloads the default Gemma 4 E4B model and its required assets. Follow its progress with:
+The first start downloads the default Qwen3.5 9B model and its required assets. Follow its progress with:
 
 ```bash
 sudo journalctl -u qtrobot-llama-cpp.service -f
@@ -280,15 +280,15 @@ Use these commands to manage the demo:
 
 ## Choose a language model
 
-The default **Gemma 4 E4B Q8** model provides the best tested balance of
-responsiveness, multimodal understanding, tool use, and conversational
-reliability for this demo. The `qtrobot-llama-cpp` service also includes several
-ready-to-use alternatives:
+The default **Qwen3.5 9B Q8** model provides the best tested balance of visual
+understanding, multi-step tool use, agentic work, instruction following, and
+interactive speed for this demo. The `qtrobot-llama-cpp` service also includes
+several ready-to-use alternatives:
 
 | Model | Preset | Recommended use | Weighted speed on QTPC |
 |---|---|---|---:|
-| **Gemma 4 E4B Q8** (default) | `gemma4-e4b` | Best overall balance for responsive conversation, vision, and agentic tool use | **~35.6 tok/s** |
-| **Qwen3.5 9B Q8** | `qwen3.5-9b` | Recommended alternative for multimodal conversation, vision, agentic work, instruction following, and tool use | **~16.4 tok/s** |
+| **Qwen3.5 9B Q8** (default) | `qwen3.5-9b` | Best tested balance for multimodal conversation, vision, multi-step tool use, agentic work, and instruction following | **~16.4 tok/s** |
+| **Gemma 4 E4B Q8** | `gemma4-e4b` | Fastest option for responsive conversation, vision, and straightforward tool use | **~35.6 tok/s** |
 | **Gemma 4 12B Q8** | `gemma4-12b` | Strong reasoning and multimodal capability, but it may occasionally produce unusually long responses in this setup | **~21.6 tok/s** |
 | **Qwen3.8 27B Q8** | `qwen3.8-27b` | Highest-capability option for complex reasoning, advanced vision, coding, and long-horizon agentic work | **~9.1 tok/s** |
 
