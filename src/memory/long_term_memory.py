@@ -18,6 +18,7 @@ DOCUMENT_KIND = "document"
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+_FASTEMBED_CACHE_DIR = Path.home() / ".cache" / "fastembed"
 RERANK_POOL_SIZE = 20
 TIME_HINTS = ("today", "yesterday", "this_week", "last_week", "this_month", "earlier")
 
@@ -49,8 +50,14 @@ class LongTermMemory:
         self.chat_history_path = (
             Path(chat_history_path) if chat_history_path is not None else None
         )
-        self._embedder = TextEmbedding(model_name=model_name)
-        self._reranker = TextCrossEncoder(model_name=rerank_model)
+        self._embedder = TextEmbedding(
+            model_name=model_name,
+            cache_dir=str(_FASTEMBED_CACHE_DIR),
+        )
+        self._reranker = TextCrossEncoder(
+            model_name=rerank_model,
+            cache_dir=str(_FASTEMBED_CACHE_DIR),
+        )
         self.chunk_chars = chunk_chars
         self.chunk_overlap = chunk_overlap
 
