@@ -24,5 +24,9 @@ class ToolBase(ABC):
     def register(self, schema: McpSchema) -> None:
         """Register this provider's methods on ``schema``."""
 
+    def cancellations(self) -> dict[str, str]:
+        """Map public action tools to private cancellation tools."""
+        return {}
+
     def cleanup(self) -> None:
         """Release resources owned by the provider."""

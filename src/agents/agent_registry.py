@@ -1,4 +1,4 @@
-"""Construction and lifecycle owner for optional background agents."""
+"""Construction and lifecycle owner for isolated agents."""
 
 from __future__ import annotations
 
@@ -10,9 +10,11 @@ from typing import Any
 from luxai.magpie.utils import Logger
 
 from tool.local_tool_server import LocalToolServer
+from tool.providers.user_tools import UserTools
 from tool.tool_base import ToolBase
 
 from .agent_base import AGENT_TOOLS_ENDPOINT
+from .object_search import ObjectSearchAgent, ObjectSearchTools
 from .web_search import WebSearchAgent, WebSearchTools
 
 
@@ -26,34 +28,53 @@ class AgentRegistry:
         *,
         owner_loop: asyncio.AbstractEventLoop,
         event_sink: Callable[[dict[str, Any]], None],
+        user_tools: UserTools,
+        web_search_enabled: bool = False,
         api_key: str | None = None,
         endpoint: str = AGENT_TOOLS_ENDPOINT,
         completion_extra_body: Mapping[str, Any] | None = None,
     ) -> None:
-        self._agents: list[WebSearchAgent] = []
+        self._agents: list[Any] = []
         self._agent_tool_server: LocalToolServer | None = None
         self._lifecycle_lock = threading.Lock()
         self._server_stopped = False
 
-        try:
-            web_tools = WebSearchTools(api_key=api_key)
-        except ValueError as exc:
-            Logger.warning(f"Web search disabled: {exc}")
-            return
-
-        self._agent_tool_server = LocalToolServer(
-            [web_tools],
-            endpoint=endpoint,
-        )
+        object_tools = ObjectSearchTools(user_tools)
+        private_tools: list[ToolBase] = [object_tools]
         self._agents.append(
-            WebSearchAgent(
+            ObjectSearchAgent(
                 client,
                 model,
                 owner_loop=owner_loop,
-                event_sink=event_sink,
+                tools=object_tools,
                 endpoint=endpoint,
                 completion_extra_body=completion_extra_body,
             )
+        )
+        self.web_search_available = False
+
+        if web_search_enabled:
+            try:
+                web_tools = WebSearchTools(api_key=api_key)
+            except ValueError as exc:
+                Logger.warning(f"Web search disabled: {exc}")
+            else:
+                private_tools.append(web_tools)
+                self._agents.append(
+                    WebSearchAgent(
+                        client,
+                        model,
+                        owner_loop=owner_loop,
+                        event_sink=event_sink,
+                        endpoint=endpoint,
+                        completion_extra_body=completion_extra_body,
+                    )
+                )
+                self.web_search_available = True
+
+        self._agent_tool_server = LocalToolServer(
+            private_tools,
+            endpoint=endpoint,
         )
 
     def as_tools(self) -> list[ToolBase]:
@@ -61,7 +82,7 @@ class AgentRegistry:
         return list(self._agents)
 
     async def close(self) -> None:
-        """Cancel/await background jobs, then stop the private MCP server."""
+        """Close all agents, then stop their private MCP server."""
         await asyncio.gather(
             *(agent.close() for agent in self._agents),
             return_exceptions=True,

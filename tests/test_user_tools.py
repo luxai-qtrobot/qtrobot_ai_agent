@@ -6,7 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 from simplejpeg import decode_jpeg, encode_jpeg, is_jpeg
@@ -18,7 +18,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from luxai.magpie.schema import McpSchema
-from tool.providers.user_tools import CAMERA_READ_TIMEOUT, UserTools
+from tool.providers.user_tools import ARM_JOINTS, CAMERA_READ_TIMEOUT, UserTools
 
 
 class _Reader:
@@ -61,6 +61,70 @@ def _make_tools(frame=None) -> tuple[UserTools, _Reader, _ColorStream]:
 
 
 class UserToolsTests(unittest.TestCase):
+    def test_visual_search_temporarily_owns_head_and_pointing_controls(self) -> None:
+        tools, _, _ = _make_tools()
+        robot = tools._robot
+        robot.kinematics = Mock()
+        robot.talking_behavior = Mock()
+        robot.talking_behavior.get_source_config.return_value = {
+            "head_motion": True,
+            "arm_motion": True,
+        }
+        robot.motor = Mock()
+        attention = Mock()
+        attention.paused.return_value = False
+        tools._human_attention = attention
+
+        look_handle = Mock()
+        look_handle.result.return_value = True
+        point_handle = Mock()
+        point_handle.result.return_value = True
+        robot.kinematics.look_at_pixel_async.return_value = look_handle
+        robot.kinematics.aim_at_pixel_async.return_value = point_handle
+
+        tools.hold_current_gaze(60)
+        image = tools.look_at_pixel(420, 240, hold_seconds=60)
+        tools.point_at_pixel(1, 1, hold_seconds=60)
+        tools.cancel_point_at_pixel()
+        tools.cancel_look_at_pixel()
+
+        self.assertEqual(image["mimeType"], "image/jpeg")
+        attention.pause.assert_called_once_with()
+        attention.resume.assert_called_once_with()
+        robot.kinematics.look_at_pixel_async.assert_called_once_with(
+            424,
+            240,
+            depth=1.0,
+            only_gaze=False,
+            velocity=60.0,
+        )
+        robot.kinematics.aim_at_pixel_async.assert_called_once_with(
+            424,
+            479,
+            depth=1.0,
+            velocity=60.0,
+        )
+        robot.kinematics.look_at_point.assert_called_once_with(
+            1.0,
+            0.0,
+            0.6,
+            only_gaze=False,
+            velocity=60.0,
+        )
+        robot.talking_behavior.set_source_config.assert_has_calls(
+            [
+                call("media_fg", head_motion=False),
+                call("media_fg", arm_motion=False),
+                call("media_fg", arm_motion=True),
+                call("media_fg", head_motion=True),
+            ]
+        )
+        self.assertEqual(
+            robot.motor.home.call_args_list,
+            [call(joint) for joint in ARM_JOINTS],
+        )
+        tools.cleanup()
+
     def test_gesture_returns_home_after_successful_completion(self) -> None:
         tools, _, _ = _make_tools()
         handle = Mock()

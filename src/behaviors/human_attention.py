@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import statistics
+import threading
 import time
 from dataclasses import dataclass
 
@@ -227,7 +228,14 @@ class HumanAttentionBehavior(BaseNode):
         self.last_tracking_update = 0.0
         self._target_filter = _TargetFilter()
         self._selector = _AttentionSelector()
+        self._motion_gate = threading.Lock()
         super().__init__(name="human-attention")
+
+    def pause(self) -> None:
+        """Pause tracking after any in-flight head command has drained."""
+        super().pause()
+        with self._motion_gate:
+            pass
 
     def setup(self) -> None:
         self.robot.enable_plugin_local("human-detector")
@@ -384,16 +392,19 @@ class HumanAttentionBehavior(BaseNode):
         self.last_idle_look = now
 
     def _set_look_target(self, x: float, y: float, z: float) -> None:
-        try:
-            self.robot.kinematics.set_look_target(
-                x,
-                y,
-                z,
-                only_gaze=False,
-                velocity=self.look_velocity,
-            )
-        except Exception as exc:
-            Logger.warning(f"Human attention look target ignored: {exc}")
+        with self._motion_gate:
+            if self.paused():
+                return
+            try:
+                self.robot.kinematics.set_look_target(
+                    x,
+                    y,
+                    z,
+                    only_gaze=False,
+                    velocity=self.look_velocity,
+                )
+            except Exception as exc:
+                Logger.warning(f"Human attention look target ignored: {exc}")
 
     def cleanup(self) -> None:
         if self.reader is not None:

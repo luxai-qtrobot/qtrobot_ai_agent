@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import threading
 import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -16,7 +15,7 @@ SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from agents import AgentBase, AgentRegistry, WebSearchAgent
+from agents import AgentBase, AgentRegistry, ObjectSearchAgent, WebSearchAgent
 from agents.web_search.tools import (
     FETCH_TIMEOUT_SECONDS,
     MAX_FETCH_CHARACTERS,
@@ -315,33 +314,43 @@ class WebSearchToolsTests(unittest.TestCase):
 
 
 class AgentRegistryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_enabled_registry_exposes_agent_and_closes_idempotently(self):
+    async def test_registry_exposes_object_and_enabled_web_agents(self):
         registry = AgentRegistry(
             client=None,
             model="test-model",
             owner_loop=asyncio.get_running_loop(),
             event_sink=lambda _event: None,
+            user_tools=Mock(),
+            web_search_enabled=True,
             api_key="fake-key",
             endpoint=f"inproc://test-registry-{uuid.uuid4().hex}",
         )
 
-        self.assertEqual(len(registry.as_tools()), 1)
-        self.assertIsInstance(registry.as_tools()[0], WebSearchAgent)
+        agents = registry.as_tools()
+        self.assertEqual(len(agents), 2)
+        self.assertIsInstance(agents[0], ObjectSearchAgent)
+        self.assertIsInstance(agents[1], WebSearchAgent)
+        self.assertTrue(registry.web_search_available)
         await registry.close()
         await registry.close()
         registry.cleanup()
 
-    async def test_missing_tavily_key_disables_agent_cleanly(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TAVILY_API_KEY", None)
-            registry = AgentRegistry(
-                client=None,
-                model="test-model",
-                owner_loop=asyncio.get_running_loop(),
-                event_sink=lambda _event: None,
-            )
+    async def test_object_agent_remains_when_web_search_is_disabled(self):
+        registry = AgentRegistry(
+            client=None,
+            model="test-model",
+            owner_loop=asyncio.get_running_loop(),
+            event_sink=lambda _event: None,
+            user_tools=Mock(),
+            web_search_enabled=False,
+            api_key="unused-key",
+            endpoint=f"inproc://test-registry-{uuid.uuid4().hex}",
+        )
 
-        self.assertEqual(registry.as_tools(), [])
+        agents = registry.as_tools()
+        self.assertEqual(len(agents), 1)
+        self.assertIsInstance(agents[0], ObjectSearchAgent)
+        self.assertFalse(registry.web_search_available)
         await registry.close()
         await registry.close()
         registry.cleanup()

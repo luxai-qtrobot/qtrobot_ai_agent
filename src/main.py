@@ -48,8 +48,8 @@ AGENT_LLM_TIMEOUT_SECONDS      = 60.0
 RUNTIME_SETTING_TIMEOUT_SECONDS = 15.0
 S2S_CONNECT_RETRY_SECONDS      = 3.0
 
-# Keep the initial robot surface deliberately small. Local get_datetime and
-# get_image are discovered independently through LocalToolServer.
+# Keep the remote robot RPC surface deliberately small. Application-owned
+# tools are discovered independently through LocalToolServer.
 ROBOT_TOOL_WHITELIST = {
     "face_emotion_list": None,
     "gesture_file_list": None,    
@@ -368,6 +368,7 @@ async def run(config: AppConfig) -> None:
         camera_endpoint = str(parameters.camera.endpoint)
         Logger.info(f"Enabling QTrobot camera as {camera_endpoint}...")
         robot.enable_plugin_zmq("realsense-driver", endpoint=camera_endpoint)
+        robot.enable_plugin_local("kinematics")
 
         robot.speaker.set_volume(float(parameters.robot.volume) / 100.0)
 
@@ -401,30 +402,31 @@ async def run(config: AppConfig) -> None:
         def emit_background_event(event: dict) -> None:
             loop.call_soon_threadsafe(background_events.put_nowait, dict(event))
 
-        if bool(parameters.web_search.enabled):
-            agent_base_url = os.getenv(
-                "OPENAI_AGENT_BASE_URL",
-                DEFAULT_AGENT_LLM_BASE_URL,
-            )
-            agent_model = os.getenv(
-                "OPENAI_AGENT_MODEL",
-                DEFAULT_AGENT_LLM_MODEL,
-            )
-            agent_client = AsyncOpenAI(
-                base_url=agent_base_url,
-                api_key=os.getenv("OPENAI_AGENT_API_KEY", "not-needed"),
-                timeout=AGENT_LLM_TIMEOUT_SECONDS,
-                max_retries=0,
-            )
-            agents = AgentRegistry(
-                agent_client,
-                agent_model,
-                owner_loop=loop,
-                event_sink=emit_background_event,
-                api_key=str(parameters.web_search.api_key).strip() or None,
-            )
+        user_tools = UserTools(robot, human_attention)
+        agent_base_url = os.getenv(
+            "OPENAI_AGENT_BASE_URL",
+            DEFAULT_AGENT_LLM_BASE_URL,
+        )
+        agent_model = os.getenv(
+            "OPENAI_AGENT_MODEL",
+            DEFAULT_AGENT_LLM_MODEL,
+        )
+        agent_client = AsyncOpenAI(
+            base_url=agent_base_url,
+            api_key=os.getenv("OPENAI_AGENT_API_KEY", "not-needed"),
+            timeout=AGENT_LLM_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+        agents = AgentRegistry(
+            agent_client,
+            agent_model,
+            owner_loop=loop,
+            event_sink=emit_background_event,
+            user_tools=user_tools,
+            web_search_enabled=bool(parameters.web_search.enabled),
+            api_key=str(parameters.web_search.api_key).strip() or None,
+        )
 
-        user_tools = UserTools(robot)
         reminder_tools = ReminderTools(emit_background_event)
         memory_enabled = bool(parameters.memory.enabled)
         documents_enabled = bool(parameters.documents.enabled)
@@ -470,9 +472,13 @@ async def run(config: AppConfig) -> None:
         providers = [user_tools, reminder_tools]
         if memory_tools is not None:
             providers.append(memory_tools)
-        if agents is not None:
-            providers.extend(agents.as_tools())
-        web_search_available = bool(agents is not None and agents.as_tools())
+        providers.extend(agents.as_tools())
+        web_search_available = agents.web_search_available
+        local_cancellations = {
+            action: cancel
+            for provider in providers
+            for action, cancel in provider.cancellations().items()
+        }
         local_tool_server = LocalToolServer(providers)
         local_requester = ZMQRpcRequester(LOCAL_TOOLS_ENDPOINT)
         robot_requester = ZMQRpcRequester(robot_endpoint)
@@ -484,6 +490,7 @@ async def run(config: AppConfig) -> None:
             tool_engine = ToolEngine(
                 {"local": local_client, "robot": robot_client},
                 whitelists={"robot": ROBOT_TOOL_WHITELIST},
+                cancellations={"local": local_cancellations},
             )
             await tool_engine.discover()
             await _run_conversation(
@@ -505,15 +512,15 @@ async def run(config: AppConfig) -> None:
             await s2s_client.close()
         except Exception as exc:
             Logger.warning(f"Could not close S2S client: {exc}")
-        if human_attention is not None:
-            human_attention.terminate(
-                timeout=HUMAN_IDLE_ATTENTION_TIMEOUT + 1.0
-            )
         if agents is not None:
             try:
                 await agents.close()
             except Exception as exc:
                 Logger.warning(f"Could not cleanly stop agents: {exc}")
+        if human_attention is not None:
+            human_attention.terminate(
+                timeout=HUMAN_IDLE_ATTENTION_TIMEOUT + 1.0
+            )
         if agent_client is not None:
             try:
                 await agent_client.close()

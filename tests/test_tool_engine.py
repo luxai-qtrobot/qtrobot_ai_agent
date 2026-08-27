@@ -94,6 +94,32 @@ class ToolEngineTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_image_result_preserves_answer_metadata(self) -> None:
+        result = ToolEngine({})._normalize_result(
+            "call-object-search",
+            SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=(
+                            '{"answer":"The phone is on the table.",'
+                            f'"mimeType":"image/jpeg","data":"{JPEG_BASE64}"}}'
+                        ),
+                    )
+                ],
+                structured_content=None,
+            ),
+        )
+
+        self.assertEqual(
+            result["output"],
+            '{"answer":"The phone is on the table."}',
+        )
+        self.assertEqual(
+            result["images"],
+            [{"mime_type": "image/jpeg", "data": JPEG_BASE64}],
+        )
+
     async def test_tracked_cancellation_calls_paired_cancel_tool(self) -> None:
         class BlockingClient:
             def __init__(self) -> None:
@@ -129,12 +155,16 @@ class ToolEngineTests(unittest.IsolatedAsyncioTestCase):
 
         client = BlockingClient()
         engine = ToolEngine(
-            {"robot": client},
-            whitelists={
-                "robot": {"gesture_file_play": "gesture_cancel"},
+            {"local": client},
+            cancellations={
+                "local": {"gesture_file_play": "gesture_cancel"},
             },
         )
         await engine.discover()
+        self.assertNotIn(
+            "gesture_cancel",
+            {schema["name"] for schema in engine.schemas()},
+        )
         execution = asyncio.create_task(
             engine.execute_tracked(
                 [
