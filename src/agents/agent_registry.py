@@ -47,6 +47,7 @@ class AgentRegistry:
                 model,
                 owner_loop=owner_loop,
                 tools=object_tools,
+                event_sink=event_sink,
                 endpoint=endpoint,
                 completion_extra_body=completion_extra_body,
             )
