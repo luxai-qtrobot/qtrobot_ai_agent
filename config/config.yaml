@@ -68,6 +68,58 @@ parameters:
     description: Human detector endpoint
     scope: cli
 
+- name: visitor_engagement
+  type: group
+  description: Public-space visitor interaction
+  parameters:
+  - name: enabled
+    type: bool
+    value: false
+    description: Gate interaction by visitor engagement
+    scope: cli
+
+  - name: conversation_distance_m
+    type: double
+    value: 1.5
+    description: Maximum conversation distance
+    scope: cli
+
+  - name: conversation_min_score
+    type: double
+    value: 0.55
+    description: Minimum conversation attention score
+    scope: cli
+
+  - name: close_grace_seconds
+    type: double
+    value: 10.0
+    description: Delay before closing the microphone
+    scope: cli
+
+  - name: welcome_enabled
+    type: bool
+    value: true
+    description: Welcome interested visitors
+    scope: cli
+
+  - name: welcome_distance_m
+    type: double
+    value: 3.0
+    description: Maximum welcoming distance
+    scope: cli
+
+  - name: welcome_min_score
+    type: double
+    value: 0.55
+    description: Minimum welcoming attention score
+    scope: cli
+
+  - name: welcome_cooldown_seconds
+    type: double
+    value: 60.0
+    description: Minimum time between welcomes
+    scope: cli
+
 - name: s2s
   type: group
   description: magpie Speech-to-speech service settings

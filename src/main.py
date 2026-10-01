@@ -19,7 +19,7 @@ from openai import AsyncOpenAI
 
 from agents import AgentRegistry
 from app_config import AppConfig
-from behaviors import HumanAttentionBehavior
+from behaviors import HumanAttentionBehavior, VisitorEngagementConfig
 from memory import DirectoryReader, LongTermMemory
 from qtrobot_audio import RobotMicSource, RobotSpeakerSink
 from s2s import S2SClient, ToolCallCoordinator
@@ -118,10 +118,14 @@ async def _send_microphone(
     microphone: RobotMicSource,
     client: S2SClient,
     interaction_paused: asyncio.Event,
+    human_attention: HumanAttentionBehavior | None,
 ) -> None:
     while True:
         frame = await microphone.read()
-        if not interaction_paused.is_set():
+        if (
+            not interaction_paused.is_set()
+            and (human_attention is None or human_attention.microphone_enabled())
+        ):
             client.send_audio(frame)
 
 
@@ -223,6 +227,7 @@ async def _run_conversation(
     web_search_available: bool,
     memory_enabled: bool,
     documents_enabled: bool,
+    human_attention: HumanAttentionBehavior | None,
 ) -> None:
     parameters = config.parameters
     tasks: set[asyncio.Task[None]] = set()
@@ -291,7 +296,12 @@ async def _run_conversation(
             microphone.start()
             tasks = {
                 asyncio.create_task(
-                    _send_microphone(microphone, client, interaction_paused),
+                    _send_microphone(
+                        microphone,
+                        client,
+                        interaction_paused,
+                        human_attention,
+                    ),
                     name="qtrobot-microphone-to-s2s",
                 ),
                 asyncio.create_task(
@@ -387,11 +397,26 @@ async def run(config: AppConfig) -> None:
         robot.motor.home_all()
 
         if bool(parameters.human_attention.enabled):
+            visitor = parameters.visitor_engagement
             human_attention = HumanAttentionBehavior(
                 robot,
                 detector_endpoint=str(parameters.human_attention.detector_endpoint),
                 idle_attention_timeout=HUMAN_IDLE_ATTENTION_TIMEOUT,
                 look_velocity=60,
+                visitor_engagement=VisitorEngagementConfig(
+                    enabled=bool(visitor.enabled),
+                    conversation_distance_m=float(visitor.conversation_distance_m),
+                    conversation_min_score=float(visitor.conversation_min_score),
+                    close_grace_seconds=float(visitor.close_grace_seconds),
+                    welcome_enabled=bool(visitor.welcome_enabled),
+                    welcome_distance_m=float(visitor.welcome_distance_m),
+                    welcome_min_score=float(visitor.welcome_min_score),
+                    welcome_cooldown_seconds=float(visitor.welcome_cooldown_seconds),
+                ),
+            )
+        elif bool(parameters.visitor_engagement.enabled):
+            raise ValueError(
+                "visitor_engagement requires human_attention.enabled=true"
             )
 
         microphone = RobotMicSource(robot, asyncio.get_running_loop())
@@ -506,6 +531,7 @@ async def run(config: AppConfig) -> None:
                 web_search_available,
                 memory_enabled,
                 documents_available,
+                human_attention,
             )
     finally:
         try:
