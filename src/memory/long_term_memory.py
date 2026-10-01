@@ -63,6 +63,8 @@ class LongTermMemory:
 
         self._lock = threading.Lock()
         self._vectors: np.ndarray | None = None
+        self._pending_vectors: list[np.ndarray] = [] # updated code by sd
+
         self._records: list[_Record] = []
         self._documents: list[str] = []
 
@@ -114,6 +116,8 @@ class LongTermMemory:
     def wait_for_documents(self) -> None:
         """Wait until all documents submitted during startup are ready to search."""
         self._store_queue.join()
+        with self._lock:                # added by sd
+            self._matrix_locked()       # added by sd       
 
     def search(
         self,
@@ -124,7 +128,8 @@ class LongTermMemory:
     ) -> list[dict[str, Any]]:
         """Retrieve and rerank records, optionally filtering by kind and time."""
         with self._lock:
-            vectors = self._vectors
+            # vectors = self._vectors                   # commented by sd
+            vectors = self._matrix_locked()             # added by sd
             records = list(self._records)
 
         if vectors is None or not records:
@@ -168,6 +173,17 @@ class LongTermMemory:
             for record in ranked
         ]
 
+    def _matrix_locked(self)-> np.ndarray | None:  # added by sd
+        if self._pending_vectors:
+            pending = np.vstack(self._pending_vectors)
+            self._vectors = (
+                pending if self._vectors is None else np.vstack([self._vectors, pending])
+            )
+            self._pending_vectors.clear()
+
+        return self._vectors
+
+    
     def _load_chat_history(self) -> None:
         if self.chat_history_path is None or not self.chat_history_path.exists():
             return
@@ -203,7 +219,8 @@ class LongTermMemory:
         vectors = self._embed([record.text for record in records])
         with self._lock:
             self._records.extend(records)
-            self._vectors = vectors
+            # self._vectors = vectors  commented by sd
+            self._pending_vectors.extend(list(vectors))  # added by sd
         Logger.info(
             f"[LongTermMemory] loaded {len(records)} chat message(s) from "
             f"{self.chat_history_path}"
@@ -243,11 +260,12 @@ class LongTermMemory:
 
         vector = self._embed([record.text])[0]
         with self._lock:
-            self._vectors = (
-                vector.reshape(1, -1)
-                if self._vectors is None
-                else np.vstack([self._vectors, vector])
-            )
+            # self._vectors = (
+            #     vector.reshape(1, -1)
+            #     if self._vectors is None
+            #     else np.vstack([self._vectors, vector])
+            # )  commented by sd
+            self._pending_vectors.append(vector)  # added by sd
             self._records.append(record)
         Logger.debug(
             f"[LongTermMemory] stored {record.kind} record "
