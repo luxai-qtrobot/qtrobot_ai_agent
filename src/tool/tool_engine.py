@@ -47,6 +47,7 @@ class ToolEngine:
         sources: Mapping[str, Client],
         whitelists: Mapping[str, ToolWhitelist] | None = None,
         *,
+        cancellations: Mapping[str, Mapping[str, str]] | None = None,
         retries: int = 0,
     ) -> None:
         if retries < 0:
@@ -58,6 +59,10 @@ class ToolEngine:
                 self._whitelists[source] = dict(whitelist)
             else:
                 self._whitelists[source] = {name: None for name in whitelist}
+        self._cancellations = {
+            source: dict(mapping)
+            for source, mapping in (cancellations or {}).items()
+        }
         self._retries = retries
         self._tools: dict[str, tuple[Client, str, str | None]] = {}
         self._schemas: list[dict[str, Any]] = []
@@ -78,24 +83,44 @@ class ToolEngine:
 
         for source_name, client in self._sources.items():
             discovered = list(await client.list_tools())
+            available = {tool.name for tool in discovered}
             whitelist = self._whitelists.get(source_name)
+            cancellations = dict(self._cancellations.get(source_name, {}))
             if whitelist is not None:
-                available = {tool.name for tool in discovered}
                 missing = sorted(set(whitelist) - available)
-                cancel_names = {name for name in whitelist.values() if name}
-                missing_cancel_tools = sorted(cancel_names - available)
                 if missing:
                     Logger.warning(
                         f"ToolEngine: {source_name} is missing tools: {missing}"
                     )
-                if missing_cancel_tools:
-                    Logger.warning(
-                        f"ToolEngine: {source_name} is missing cancel tools: "
-                        f"{missing_cancel_tools}"
-                    )
                 discovered = [tool for tool in discovered if tool.name in whitelist]
+                cancellations.update(
+                    {
+                        name: cancel_name
+                        for name, cancel_name in whitelist.items()
+                        if cancel_name
+                    }
+                )
+
+            missing_actions = sorted(set(cancellations) - available)
+            missing_cancel_tools = sorted(
+                set(cancellations.values()) - available
+            )
+            if missing_actions:
+                Logger.warning(
+                    f"ToolEngine: {source_name} is missing cancellable tools: "
+                    f"{missing_actions}"
+                )
+            if missing_cancel_tools:
+                Logger.warning(
+                    f"ToolEngine: {source_name} is missing cancel tools: "
+                    f"{missing_cancel_tools}"
+                )
+
+            hidden_cancel_tools = set(cancellations.values())
 
             for tool in discovered:
+                if tool.name in hidden_cancel_tools:
+                    continue
                 if tool.name == CANCEL_ALL_TOOL_NAME:
                     raise ValueError(
                         f"Tool name {CANCEL_ALL_TOOL_NAME!r} is reserved by ToolEngine"
@@ -106,7 +131,7 @@ class ToolEngine:
                         f"Tool {tool.name!r} is defined by both "
                         f"{other_source!r} and {source_name!r}"
                     )
-                cancel_name = whitelist.get(tool.name) if whitelist is not None else None
+                cancel_name = cancellations.get(tool.name)
                 tools[tool.name] = (client, source_name, cancel_name)
                 schemas.append(
                     {
@@ -312,14 +337,28 @@ class ToolEngine:
                 seen_images.add(key)
                 images.append(validated)
 
+        def add_image_envelope(value: Any) -> bool:
+            envelope = self._extract_image_envelope(value)
+            if envelope is None:
+                return False
+            mime_type, data, metadata = envelope
+            add_image(mime_type, data)
+            if metadata and not text_parts:
+                text_parts.append(
+                    json.dumps(
+                        metadata,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                )
+            return True
+
         for block in getattr(result, "content", ()) or ():
             block_type = getattr(block, "type", "unknown")
             if block_type == "text":
-                image = self._extract_image_envelope(getattr(block, "text", ""))
-                if image is None:
-                    text_parts.append(str(getattr(block, "text", "")))
-                else:
-                    add_image(*image)
+                value = getattr(block, "text", "")
+                if not add_image_envelope(value):
+                    text_parts.append(str(value))
             elif block_type == "image":
                 add_image(
                     getattr(block, "mimeType", None),
@@ -332,10 +371,7 @@ class ToolEngine:
         if structured is None:
             structured = getattr(result, "structuredContent", None)
         if structured is not None:
-            image = self._extract_image_envelope(structured)
-            if image is not None:
-                add_image(*image)
-            elif not text_parts:
+            if not add_image_envelope(structured) and not text_parts:
                 text_parts.append(
                     json.dumps(structured, separators=(",", ":"), ensure_ascii=False)
                 )
@@ -345,8 +381,10 @@ class ToolEngine:
             text = "Image captured." if images else "Done."
         return {"tool_call_id": call_id, "output": text, "images": images}
 
-    @classmethod
-    def _extract_image_envelope(cls, value: Any) -> tuple[str, str] | None:
+    @staticmethod
+    def _extract_image_envelope(
+        value: Any,
+    ) -> tuple[Any, Any, dict[str, Any]] | None:
         if isinstance(value, str):
             try:
                 value = json.loads(value)
@@ -356,8 +394,12 @@ class ToolEngine:
             return None
         if "mimeType" not in value or "data" not in value:
             return None
-        image = cls._validate_image_payload(value.get("mimeType"), value.get("data"))
-        return image["mime_type"], image["data"]
+        metadata = {
+            key: item
+            for key, item in value.items()
+            if key not in {"mimeType", "data"}
+        }
+        return value.get("mimeType"), value.get("data"), metadata
 
     @staticmethod
     def _validate_image_payload(mime_type: Any, data: Any) -> ToolImage:

@@ -26,9 +26,12 @@ from memory or claim completion before the matching background event arrives."""
 
 CAMERA_INSTRUCTIONS = """## Camera perception
 
-For any question requiring QTrobot's current view, MUST call get_image before
-answering. Describe only relevant visible details; if unclear or not visible,
-say so instead of guessing."""
+For current-scene questions, MUST use visual tools. Call get_image for the
+current view. To look elsewhere or center a visible target, call look_at_pixel
+using its pixel in the latest 840x480 image; it returns a fresh view. If asked
+to find a target whose location is unknown, call search_object instead. Use
+point_at_pixel only for a confidently located target. Describe visible
+evidence; if unclear or absent, do not guess."""
 
 
 EMBODIED_INTERACTION_INSTRUCTIONS = """## Embodied interaction

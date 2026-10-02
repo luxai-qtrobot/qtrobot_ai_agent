@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import statistics
+import threading
 import time
 from dataclasses import dataclass
 
@@ -31,6 +32,9 @@ TARGET_SMOOTHING_ALPHA = 0.45
 MAX_TARGET_ANGULAR_SPEED_DEGREES_PER_SECOND = 60.0
 MAX_FILTER_TIMESTEP_SECONDS = 0.25
 TRACK_FILTER_TTL_SECONDS = 2.0
+VISITOR_GATE_OPEN_CONFIRMATION_SECONDS = 0.6
+VISITOR_STATE_POLL_SECONDS = 0.5
+VISITOR_DEBUG_LOG_INTERVAL_SECONDS = 2.0
 
 MAX_FACE_DEPTH_DEVIATION_METERS = 0.25
 FACE_TARGET_Z_OFFSET_METERS = 0.15
@@ -50,6 +54,20 @@ class _PersonCandidate:
     target: tuple[float, float, float]
     distance: float
     score: float
+
+
+@dataclass(frozen=True)
+class VisitorEngagementConfig:
+    """Optional public-space microphone gate and visitor welcome behavior."""
+
+    enabled: bool = False
+    conversation_distance_m: float = 1.5
+    conversation_min_score: float = 0.55
+    close_grace_seconds: float = 10.0
+    welcome_enabled: bool = True
+    welcome_distance_m: float = 3.0
+    welcome_min_score: float = 0.55
+    welcome_cooldown_seconds: float = 60.0
 
 
 @dataclass
@@ -204,11 +222,28 @@ class HumanAttentionBehavior(BaseNode):
         maximum_tracking_distance: float = MAX_TRACKING_DISTANCE_METERS,
         look_velocity: float = 300.0,
         tracking_fps: float = 10.0,
+        visitor_engagement: VisitorEngagementConfig | None = None,
     ) -> None:
         if tracking_fps <= 0:
             raise ValueError("tracking_fps must be greater than zero")
         if maximum_tracking_distance <= MIN_TRACKING_DISTANCE_METERS:
             raise ValueError("maximum_tracking_distance is too small")
+
+        visitor_engagement = visitor_engagement or VisitorEngagementConfig()
+        if visitor_engagement.conversation_distance_m <= MIN_TRACKING_DISTANCE_METERS:
+            raise ValueError("conversation_distance_m is too small")
+        if visitor_engagement.welcome_distance_m < visitor_engagement.conversation_distance_m:
+            raise ValueError("welcome_distance_m must be at least conversation_distance_m")
+        if visitor_engagement.welcome_distance_m > maximum_tracking_distance:
+            raise ValueError("welcome_distance_m exceeds maximum_tracking_distance")
+        if not 0.0 <= visitor_engagement.conversation_min_score <= 1.0:
+            raise ValueError("conversation_min_score must be between 0 and 1")
+        if not 0.0 <= visitor_engagement.welcome_min_score <= 1.0:
+            raise ValueError("welcome_min_score must be between 0 and 1")
+        if visitor_engagement.close_grace_seconds < 0.0:
+            raise ValueError("close_grace_seconds must not be negative")
+        if visitor_engagement.welcome_cooldown_seconds < 0.0:
+            raise ValueError("welcome_cooldown_seconds must not be negative")
 
         self.robot = robot
         self.detector_endpoint = detector_endpoint
@@ -219,6 +254,7 @@ class HumanAttentionBehavior(BaseNode):
         self.maximum_tracking_distance = maximum_tracking_distance
         self.look_velocity = look_velocity
         self.tracking_interval = 1.0 / tracking_fps
+        self.visitor_engagement = visitor_engagement
         self.reader = None
 
         now = time.monotonic()
@@ -227,7 +263,28 @@ class HumanAttentionBehavior(BaseNode):
         self.last_tracking_update = 0.0
         self._target_filter = _TargetFilter()
         self._selector = _AttentionSelector()
+        self._motion_gate = threading.Lock()
+        self._microphone_gate = threading.Event()
+        if not visitor_engagement.enabled:
+            self._microphone_gate.set()
+        self._conversation_candidate_since: float | None = None
+        self._last_conversation_candidate = now
+        self._welcome_audience_present = False
+        self._last_welcome = now - visitor_engagement.welcome_cooldown_seconds
+        self._welcome_in_progress = False
+        self._last_visitor_debug_log = 0.0
         super().__init__(name="human-attention")
+
+    def microphone_enabled(self) -> bool:
+        """Return whether microphone frames may be forwarded to S2S."""
+
+        return self._microphone_gate.is_set()
+
+    def pause(self) -> None:
+        """Pause tracking after any in-flight head command has drained."""
+        super().pause()
+        with self._motion_gate:
+            pass
 
     def setup(self) -> None:
         self.robot.enable_plugin_local("human-detector")
@@ -252,10 +309,20 @@ class HumanAttentionBehavior(BaseNode):
             f"tracking at {1.0 / self.tracking_interval:g} FPS; "
             f"idle look every {self.idle_attention_timeout:g}s"
         )
+        if self.visitor_engagement.enabled:
+            Logger.info(
+                "Visitor engagement enabled: microphone gate closed; "
+                f"conversation distance {self.visitor_engagement.conversation_distance_m:g}m"
+            )
 
     def process(self) -> None:
         try:
-            frame = self.reader.read(timeout=self.idle_attention_timeout)
+            timeout = (
+                min(self.idle_attention_timeout, VISITOR_STATE_POLL_SECONDS)
+                if self.visitor_engagement.enabled
+                else self.idle_attention_timeout
+            )
+            frame = self.reader.read(timeout=timeout)
         except TimeoutError:
             frame = None
 
@@ -271,8 +338,15 @@ class HumanAttentionBehavior(BaseNode):
         if candidates:
             self.last_valid_person_seen = now
 
+        conversation_candidates = self._update_visitor_engagement(candidates, now)
+        focus_candidates = (
+            conversation_candidates
+            if self.visitor_engagement.enabled and self._microphone_gate.is_set()
+            else candidates
+        )
+
         previous_person_id = self._selector.current_person_id
-        selected = self._selector.select(candidates, now)
+        selected = self._selector.select(focus_candidates, now)
         if selected is not None:
             if selected.person_id != previous_person_id:
                 Logger.debug(
@@ -289,6 +363,120 @@ class HumanAttentionBehavior(BaseNode):
             return
 
         self._update_idle_attention(now)
+
+    def _update_visitor_engagement(
+        self,
+        candidates: dict[str, _PersonCandidate],
+        now: float,
+    ) -> dict[str, _PersonCandidate]:
+        settings = self.visitor_engagement
+        if not settings.enabled:
+            return candidates
+
+        conversation_candidates = {
+            person_id: candidate
+            for person_id, candidate in candidates.items()
+            if candidate.distance <= settings.conversation_distance_m
+            and candidate.score >= settings.conversation_min_score
+        }
+
+        if conversation_candidates:
+            self._last_conversation_candidate = now
+            if self._conversation_candidate_since is None:
+                self._conversation_candidate_since = now
+            elif (
+                not self._microphone_gate.is_set()
+                and now - self._conversation_candidate_since
+                >= VISITOR_GATE_OPEN_CONFIRMATION_SECONDS
+            ):
+                self._microphone_gate.set()
+                Logger.info("Visitor microphone gate opened.")
+        else:
+            self._conversation_candidate_since = None
+            if (
+                self._microphone_gate.is_set()
+                and now - self._last_conversation_candidate
+                >= settings.close_grace_seconds
+            ):
+                self._microphone_gate.clear()
+                Logger.info("Visitor microphone gate closed.")
+
+        welcome_candidates = [
+            candidate
+            for candidate in candidates.values()
+            if settings.conversation_distance_m < candidate.distance
+            <= settings.welcome_distance_m
+            and candidate.score >= settings.welcome_min_score
+        ]
+        welcome_audience_present = bool(welcome_candidates)
+        if now - self._last_visitor_debug_log >= VISITOR_DEBUG_LOG_INTERVAL_SECONDS:
+            best = max(candidates.values(), key=lambda item: item.score, default=None)
+            best_summary = (
+                f"best person={best.person_id}, distance={best.distance:.2f}m, "
+                f"score={best.score:.3f}"
+                if best is not None
+                else "no tracked person"
+            )
+            Logger.debug(
+                "Visitor engagement: "
+                f"{best_summary}; conversation candidates={len(conversation_candidates)}, "
+                f"welcome candidates={len(welcome_candidates)}, "
+                f"microphone={'open' if self._microphone_gate.is_set() else 'closed'}"
+            )
+            self._last_visitor_debug_log = now
+
+        visitor_arrived = (
+            welcome_audience_present and not self._welcome_audience_present
+        )
+        self._welcome_audience_present = welcome_audience_present
+
+        if (
+            visitor_arrived
+            and settings.welcome_enabled
+            and not conversation_candidates
+            and not self._microphone_gate.is_set()
+            and not self._welcome_in_progress
+            and now - self._last_welcome >= settings.welcome_cooldown_seconds
+        ):
+            self._last_welcome = now
+            self._welcome_visitor()
+
+        return conversation_candidates
+
+    def _welcome_visitor(self) -> None:
+        """Smile and wave once without blocking human detection."""
+
+        self._welcome_in_progress = True
+        try:
+            face_action = self.robot.face.show_emotion_async("QT/happy")
+            gesture_action = self.robot.gesture.play_file_async("QT/bye")
+        except Exception as exc:
+            self._welcome_in_progress = False
+            Logger.warning(f"Could not welcome approaching visitor: {exc}")
+            return
+
+        def completed(action) -> None:
+            try:
+                action.result()
+            except Exception as exc:
+                Logger.warning(f"QTrobot welcome gesture failed: {exc}")
+            try:
+                self.robot.motor.home_all()
+            except Exception as exc:
+                Logger.warning(f"Could not return QTrobot home after welcome: {exc}")
+            finally:
+                self._welcome_in_progress = False
+
+        gesture_action.add_done_callback(completed)
+
+        def face_completed(action) -> None:
+            try:
+                action.result()
+            except Exception as exc:
+                Logger.warning(f"QTrobot welcome expression failed: {exc}")
+
+        face_action.add_done_callback(face_completed)
+        Logger.info("Welcoming an approaching visitor with a smile and wave.")
 
     def _build_candidates(
         self,
@@ -384,16 +572,19 @@ class HumanAttentionBehavior(BaseNode):
         self.last_idle_look = now
 
     def _set_look_target(self, x: float, y: float, z: float) -> None:
-        try:
-            self.robot.kinematics.set_look_target(
-                x,
-                y,
-                z,
-                only_gaze=False,
-                velocity=self.look_velocity,
-            )
-        except Exception as exc:
-            Logger.warning(f"Human attention look target ignored: {exc}")
+        with self._motion_gate:
+            if self.paused() or self._welcome_in_progress:
+                return
+            try:
+                self.robot.kinematics.set_look_target(
+                    x,
+                    y,
+                    z,
+                    only_gaze=False,
+                    velocity=self.look_velocity,
+                )
+            except Exception as exc:
+                Logger.warning(f"Human attention look target ignored: {exc}")
 
     def cleanup(self) -> None:
         if self.reader is not None:

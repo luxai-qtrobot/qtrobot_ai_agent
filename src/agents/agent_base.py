@@ -1,4 +1,4 @@
-"""Reusable base for stateless, tool-using background agents."""
+"""Reusable base for stateless, tool-using agents."""
 
 from __future__ import annotations
 
@@ -71,6 +71,7 @@ class AgentBase(ToolBase):
         max_rounds: int = 8,
         max_tokens: int = 800,
         timeout: float = 60.0,
+        parallel_tool_calls: bool = True,
         completion_extra_body: Mapping[str, Any] | None = None,
         event_sink=None,
     ) -> None:
@@ -90,6 +91,7 @@ class AgentBase(ToolBase):
         self.max_rounds = max_rounds
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.parallel_tool_calls = parallel_tool_calls
         self.completion_extra_body = dict(
             DEFAULT_COMPLETION_EXTRA_BODY
             if completion_extra_body is None
@@ -122,7 +124,7 @@ class AgentBase(ToolBase):
                             messages=messages,
                             tools=chat_tools,
                             tool_choice="auto",
-                            parallel_tool_calls=True,
+                            parallel_tool_calls=self.parallel_tool_calls,
                             max_tokens=self.max_tokens,
                             extra_body=self.completion_extra_body,
                         ),
@@ -163,9 +165,39 @@ class AgentBase(ToolBase):
                         }
                         for result in results
                     )
+                    for result in results:
+                        if not result["images"]:
+                            continue
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Visual result returned by tool call "
+                                            f"{result['tool_call_id']}."
+                                        ),
+                                    },
+                                    *(
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": (
+                                                    f"data:{image['mime_type']};"
+                                                    f"base64,{image['data']}"
+                                                ),
+                                                "detail": "high",
+                                            },
+                                        }
+                                        for image in result["images"]
+                                    ),
+                                ],
+                            }
+                        )
 
             raise RuntimeError(
-                f"Background agent exceeded its {self.max_rounds}-round limit"
+                f"Agent exceeded its {self.max_rounds}-round limit"
             )
         finally:
             requester.close()
